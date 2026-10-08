@@ -1,0 +1,11 @@
+# Build output (rebuilt from source)
+build/
+dist/
+*.zip
+
+# Editor / OS clutter
+.vs/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
