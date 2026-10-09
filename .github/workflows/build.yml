@@ -1,4 +1,4 @@
-# Builds the plugin for Windows and macOS on GitHub's servers every time you push.
+# Builds crayonic for Windows and macOS on GitHub's servers every time you push.
 # Download the results from the "Actions" tab (Artifacts), or push a tag like v0.2.0
 # to also publish them on the repository's "Releases" page.
 
@@ -44,9 +44,9 @@ jobs:
           Copy-Item -Recurse "$out/VST3/*.vst3" dist/
           Copy-Item "$out/Standalone/*.exe" dist/
           Copy-Item Distribution/README-Windows.txt "dist/READ ME FIRST.txt"
-          Copy-Item "Distribution/Quick Start Guide.pdf" dist/
+          Copy-Item "Distribution/crayonic Quick Start Guide.pdf" dist/
           Copy-Item Assets/OFL.txt "dist/Font license (OFL).txt"
-          Compress-Archive -Path dist/* -DestinationPath "Plugin-Windows.zip"
+          Compress-Archive -Path dist/* -DestinationPath "crayonic-Windows.zip"
 
       # ---------- macOS ----------
       - name: Package (macOS)
@@ -62,9 +62,9 @@ jobs:
           done
           cp Distribution/install.command dist/ && chmod +x dist/install.command
           cp Distribution/README-Mac.txt "dist/READ ME FIRST.txt"
-          cp "Distribution/Quick Start Guide.pdf" dist/
+          cp "Distribution/crayonic Quick Start Guide.pdf" dist/
           cp Assets/OFL.txt "dist/Font license (OFL).txt"
-          ditto -c -k --keepParent dist Plugin-macOS.zip   # ditto keeps Mac bundles and permissions intact
+          ditto -c -k --keepParent dist crayonic-macOS.zip   # ditto keeps Mac bundles and permissions intact
 
       # Check the Audio Unit with Apple's own validator (results show in the log)
       - name: Validate Audio Unit (macOS)
@@ -82,11 +82,11 @@ jobs:
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: Plugin-${{ matrix.name }}
-          path: Plugin-${{ matrix.name }}.zip
+          name: crayonic-${{ matrix.name }}
+          path: crayonic-${{ matrix.name }}.zip
 
       - name: Publish release (only for version tags)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: Plugin-${{ matrix.name }}.zip
+          files: crayonic-${{ matrix.name }}.zip

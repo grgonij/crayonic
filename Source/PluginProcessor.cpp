@@ -1,5 +1,7 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include <map>
+#include <set>
 
 AudioPluginAudioProcessor::AudioPluginAudioProcessor()
     : AudioProcessor(BusesProperties().withOutput("Output", juce::AudioChannelSet::stereo(), true)),
@@ -41,7 +43,8 @@ AudioPluginAudioProcessor::AudioPluginAudioProcessor()
         fxp[(size_t)l] = { get("dist_on"), get("dist_type"), get("dist_drive"), get("dist_tone"), get("dist_mix"),
                             get("gr_on"), get("gr_size"), get("gr_density"), get("gr_spray"), get("gr_pitch"), get("gr_mix"),
                             get("dly_on"), get("dly_time"), get("dly_fb"), get("dly_mix"), get("dly_ping"),
-                            get("rev_on"), get("rev_size"), get("rev_damp"), get("rev_width"), get("rev_mix") };
+                            get("rev_on"), get("rev_size"), get("rev_damp"), get("rev_width"), get("rev_mix"),
+                            get("hpf"), get("lpf") };
     }
     masterParam = apvts.getRawParameterValue("master");
     keyArps.fill(0);
@@ -73,6 +76,34 @@ juce::AudioProcessorValueTreeState::ParameterLayout AudioPluginAudioProcessor::c
         addFloat(layerParamID(l, "vol"), name + "Volume", Range(-60.0f, 12.0f, 0.1f), 0.0f);
         addFloat(layerParamID(l, "pitch"), name + "Pitch", Range(-24.0f, 24.0f, 0.01f), 0.0f);
         // Time-stretch, 25 %..400 % of the original length. Log scale with 100 % in the middle of the knob.
+        // Filters: 20 Hz - 20 kHz on a log scale; fully left (high-pass) / fully right (low-pass) = off
+        auto freqRange = [] { return Range(20.0f, 20000.0f,
+            [](float, float, float x) { return 20.0f * std::pow(1000.0f, x); },
+            [](float, float, float v) { return std::log(v / 20.0f) / std::log(1000.0f); }); };
+        auto freqText = [](bool isHighPass)
+            {
+                return [isHighPass](float v, int)
+                    {
+                        if (isHighPass ? v <= 20.5f : v >= 19990.0f) return juce::String("off");
+                        return v >= 1000.0f ? juce::String(v / 1000.0f, v >= 10000.0f ? 1 : 2) + " kHz"
+                            : juce::String(juce::roundToInt(v)) + " Hz";
+                    };
+            };
+        auto freqParse = [](const juce::String& t)
+            {
+                const auto s = t.trim().toLowerCase();
+                if (s.startsWith("off")) return -1.0f; // clamped to the "off" end below
+                return s.getFloatValue() * (s.containsChar('k') ? 1000.0f : 1.0f);
+            };
+        layout.add(std::make_unique<juce::AudioParameterFloat>(
+            juce::ParameterID{ layerParamID(l, "hpf"), 1 }, name + "High-pass", freqRange(), 20.0f,
+            juce::AudioParameterFloatAttributes().withStringFromValueFunction(freqText(true))
+            .withValueFromStringFunction([freqParse](const juce::String& t) { const float v = freqParse(t); return v < 0.0f ? 20.0f : v; })));
+        layout.add(std::make_unique<juce::AudioParameterFloat>(
+            juce::ParameterID{ layerParamID(l, "lpf"), 1 }, name + "Low-pass", freqRange(), 20000.0f,
+            juce::AudioParameterFloatAttributes().withStringFromValueFunction(freqText(false))
+            .withValueFromStringFunction([freqParse](const juce::String& t) { const float v = freqParse(t); return v < 0.0f ? 20000.0f : v; })));
+
         addFloat(layerParamID(l, "stretch"), name + "Stretch",
             Range(25.0f, 400.0f,
                 [](float, float, float x) { return 25.0f * std::pow(16.0f, x); },
@@ -163,6 +194,21 @@ void AudioPluginAudioProcessor::prepareToPlay(double sampleRate, int samplesPerB
         f.delay.prepare(sampleRate, samplesPerBlock);
         f.reverb.setSampleRate(sampleRate);
         f.reverb.reset();
+
+        const juce::dsp::ProcessSpec spec{ sampleRate, (juce::uint32)samplesPerBlock, 2 };
+        f.hp.prepare(spec);
+        f.hp.setType(juce::dsp::StateVariableTPTFilterType::highpass);
+        f.lp.prepare(spec);
+        f.lp.setType(juce::dsp::StateVariableTPTFilterType::lowpass);
+        f.hpFreq.reset(sampleRate, 0.03);
+        f.lpFreq.reset(sampleRate, 0.03);
+        f.hpFreq.setCurrentAndTargetValue(fxp[(size_t)l].hpf->load());
+        f.lpFreq.setCurrentAndTargetValue(fxp[(size_t)l].lpf->load());
+        f.hpMix.reset(sampleRate, 0.005);
+        f.lpMix.reset(sampleRate, 0.005);
+        f.hpMix.setCurrentAndTargetValue(0.0f);
+        f.lpMix.setCurrentAndTargetValue(0.0f);
+        f.hpActive = f.lpActive = false;
     }
     for (int l = 0; l < kNumLayers; ++l)
         stopArp(l);
@@ -265,7 +311,10 @@ void AudioPluginAudioProcessor::handleNoteOn(int note, float velocity, const Slo
     play(slot);
     for (int j = 0; j < kNumLayers; ++j)
         if (j != slot && sp[slot].links[(size_t)j] && sp[j].loaded) // layers play even when muted
+        {
             play(j);
+            linkFireCount[(size_t)(slot * kNumLayers + j)]++;
+        }
 }
 
 void AudioPluginAudioProcessor::removeKeyFromArps(int note)
@@ -790,6 +839,58 @@ void AudioPluginAudioProcessor::processSlotFx(int slot, int n)
             return on;
         };
 
+    // --- High-pass / low-pass (first in the chain). Fully off at the ends of their ranges.
+    // Switching a filter on/off crossfades over 5 ms (a filter starting mid-sound rings briefly).
+    {
+        const float nyquistSafe = (float)hostSampleRate * 0.45f;
+        f.hpFreq.setTargetValue(p.hpf->load());
+        f.lpFreq.setTargetValue(juce::jmin(p.lpf->load(), 20000.0f));
+        f.hpMix.setTargetValue(f.hpFreq.getTargetValue() > 20.5f ? 1.0f : 0.0f);
+        f.lpMix.setTargetValue(f.lpFreq.getTargetValue() < 19990.0f ? 1.0f : 0.0f);
+
+        const bool runHp = f.hpMix.isSmoothing() || f.hpMix.getTargetValue() > 0.0f;
+        const bool runLp = f.lpMix.isSmoothing() || f.lpMix.getTargetValue() > 0.0f;
+        if (runHp && !f.hpActive) f.hp.reset(); // fresh start (faded in, so its first moments are hidden)
+        if (runLp && !f.lpActive) f.lp.reset();
+        f.hpActive = runHp;
+        f.lpActive = runLp;
+
+        if (runHp || runLp)
+        {
+            auto* l = bus.getWritePointer(0);
+            auto* r = bus.getWritePointer(1);
+            for (int start = 0; start < n; start += 32) // update the cutoff every 32 samples while gliding
+            {
+                const int len = juce::jmin(32, n - start);
+                const float hpHz = f.hpFreq.skip(len), lpHz = f.lpFreq.skip(len);
+                if (runHp) f.hp.setCutoffFrequency(juce::jlimit(20.0f, nyquistSafe, hpHz));
+                if (runLp) f.lp.setCutoffFrequency(juce::jlimit(20.0f, nyquistSafe, lpHz));
+                for (int i = start; i < start + len; ++i)
+                {
+                    float a = l[i], b = r[i];
+                    if (runHp)
+                    {
+                        const float m = f.hpMix.getNextValue();
+                        a += m * (f.hp.processSample(0, a) - a);
+                        b += m * (f.hp.processSample(1, b) - b);
+                    }
+                    if (runLp)
+                    {
+                        const float m = f.lpMix.getNextValue();
+                        a += m * (f.lp.processSample(0, a) - a);
+                        b += m * (f.lp.processSample(1, b) - b);
+                    }
+                    l[i] = a; r[i] = b;
+                }
+            }
+        }
+        else
+        {
+            f.hpFreq.skip(n);
+            f.lpFreq.skip(n);
+        }
+    }
+
     if (enabled(0, p.distOn, [&] { f.dist.reset(); }))
         f.dist.process(bus, n, (int)p.distType->load(), p.distDrive->load(), p.distTone->load(), p.distMix->load() * 0.01f);
 
@@ -923,19 +1024,94 @@ void AudioPluginAudioProcessor::setStateInformation(const void* data, int sizeIn
 }
 
 //==============================================================================
+// The presets-folder choice lives in a small settings file (AppData on Windows, Application Support on
+// Mac). It's opened briefly when needed rather than kept in a static, so nothing outlives the plugin.
+static juce::PropertiesFile::Options settingsOptions(const juce::String& pluginName = JucePlugin_Name)
+{
+    juce::PropertiesFile::Options o;
+    o.applicationName = pluginName;
+    o.folderName = pluginName;
+    o.filenameSuffix = ".settings";
+    o.osxLibrarySubFolder = "Application Support";
+    return o;
+}
+
+// Names this plugin was built under before it became crayonic. Their presets folders and settings
+// are carried over once, the first time the new name is used, so nobody's presets "disappear".
+static const juce::StringArray& previousNames()
+{
+    static const juce::StringArray names{ "TEST", "My Plugin" }; // plain strings: nothing to clean up at unload
+    return names;
+}
+
+static void carryOverFromPreviousName(juce::PropertiesFile& settings)
+{
+    if (settings.getBoolValue("carriedOverPreviousName", false))
+        return;
+    settings.setValue("carriedOverPreviousName", true);
+
+    const auto docs = juce::File::getSpecialLocation(juce::File::userDocumentsDirectory);
+    const auto newPresets = docs.getChildFile(JucePlugin_Name).getChildFile("Presets");
+
+    for (const auto& oldName : previousNames())
+    {
+        if (oldName == juce::String(JucePlugin_Name)) continue;
+
+        // A custom presets folder chosen in the old version (another drive, say)
+        juce::PropertiesFile oldSettings(settingsOptions(oldName));
+        const auto oldCustom = oldSettings.getValue("presetsFolder");
+        if (oldCustom.isNotEmpty() && !settings.containsKey("presetsFolder"))
+            settings.setValue("presetsFolder", oldCustom);
+
+        // The old default presets folder: copied (not moved), so the old version keeps working too
+        const auto oldPresets = docs.getChildFile(oldName).getChildFile("Presets");
+        if (oldPresets.isDirectory() && !newPresets.exists())
+            oldPresets.copyDirectoryTo(newPresets);
+    }
+    settings.saveIfNeeded();
+}
+
+juce::File AudioPluginAudioProcessor::getDefaultPresetFolder()
+{
+    return juce::File::getSpecialLocation(juce::File::userDocumentsDirectory)
+        .getChildFile(JucePlugin_Name).getChildFile("Presets");
+}
+
 juce::File AudioPluginAudioProcessor::getPresetFolder()
 {
-    auto dir = juce::File::getSpecialLocation(juce::File::userDocumentsDirectory)
-        .getChildFile(JucePlugin_Name).getChildFile("Presets");
+    juce::PropertiesFile settings(settingsOptions());
+    carryOverFromPreviousName(settings);
+    const auto custom = settings.getValue("presetsFolder");
+    if (custom.isNotEmpty() && juce::File::isAbsolutePath(custom) && juce::File(custom).isDirectory())
+        return juce::File(custom);
+
+    auto dir = getDefaultPresetFolder(); // also the fallback if a chosen drive is unplugged
     dir.createDirectory();
     return dir;
+}
+
+void AudioPluginAudioProcessor::setPresetFolder(const juce::File& folder)
+{
+    juce::PropertiesFile settings(settingsOptions());
+    if (folder == juce::File() || folder == getDefaultPresetFolder())
+        settings.removeValue("presetsFolder");
+    else
+        settings.setValue("presetsFolder", folder.getFullPathName());
+    settings.saveIfNeeded();
+}
+
+bool AudioPluginAudioProcessor::usingCustomPresetFolder()
+{
+    return getPresetFolder() != getDefaultPresetFolder();
 }
 
 bool AudioPluginAudioProcessor::savePreset(const juce::File& file)
 {
     currentPresetName = file.getFileNameWithoutExtension();
     auto xml = createStateTree(file.getParentDirectory()).createXml();
-    return xml != nullptr && xml->writeTo(file);
+    const bool ok = xml != nullptr && xml->writeTo(file);
+    if (ok) currentPresetFile = file;
+    return ok;
 }
 
 bool AudioPluginAudioProcessor::loadPreset(const juce::File& file)
@@ -944,6 +1120,7 @@ bool AudioPluginAudioProcessor::loadPreset(const juce::File& file)
     if (xml == nullptr || !applyStateTree(juce::ValueTree::fromXml(*xml), file.getParentDirectory()))
         return false;
     currentPresetName = file.getFileNameWithoutExtension(); // file name wins if it was renamed
+    currentPresetFile = file;
     return true;
 }
 
@@ -954,6 +1131,164 @@ void AudioPluginAudioProcessor::initPreset()
     for (int l = 0; l < kNumLayers; ++l)
         clearSample(l);
     currentPresetName = {};
+    currentPresetFile = juce::File();
+}
+
+//==============================================================================
+void AudioPluginAudioProcessor::copySettings(int from, int to, const juce::StringArray& names)
+{
+    if (from == to || from < 0 || to < 0 || from >= kNumLayers || to >= kNumLayers) return;
+
+    auto copy = [](juce::RangedAudioParameter* src, juce::RangedAudioParameter* dst)
+        {
+            if (src == nullptr || dst == nullptr) return;
+            dst->beginChangeGesture(); // one undo-able, automation-friendly change per setting
+            dst->setValueNotifyingHost(src->getValue());
+            dst->endChangeGesture();
+        };
+
+    for (const auto& name : names)
+    {
+        if (name == "@layers")
+        {
+            // "from plays X" becomes "to plays X", for every X other than the two sounds involved
+            for (int j = 0; j < kNumLayers; ++j)
+                if (j != from && j != to)
+                    copy(apvts.getParameter(linkParamID(from, j)), apvts.getParameter(linkParamID(to, j)));
+            continue;
+        }
+        copy(apvts.getParameter(layerParamID(from, name)), apvts.getParameter(layerParamID(to, name)));
+    }
+}
+
+juce::StringArray AudioPluginAudioProcessor::settingNamesWithPrefix(int slot, const juce::String& prefix) const
+{
+    juce::StringArray names;
+    const auto slotPrefix = layerParamID(slot, "");
+    for (auto* p : getParameters())
+        if (auto* ranged = dynamic_cast<juce::RangedAudioParameter*> (p))
+            if (const auto id = ranged->getParameterID(); id.startsWith(slotPrefix + prefix))
+                names.add(id.fromFirstOccurrenceOf(slotPrefix, false, false));
+    return names;
+}
+
+juce::Array<juce::File> AudioPluginAudioProcessor::getKitFolders()
+{
+    auto kits = getPresetFolder().findChildFiles(juce::File::findDirectories, false);
+    kits.removeIf([](const juce::File& f) { return f.isHidden() || f.getFileName().startsWithChar('.'); });
+    kits.sort();
+    return kits;
+}
+
+juce::File AudioPluginAudioProcessor::createKit(const juce::String& name)
+{
+    auto clean = juce::File::createLegalFileName(name.trim());
+    if (clean.isEmpty()) clean = "New Kit";
+    auto folder = getPresetFolder().getNonexistentChildFile(clean, {}, true); // "Kit", "Kit (2)", ...
+    folder.createDirectory();
+    return folder;
+}
+
+AudioPluginAudioProcessor::KitExport AudioPluginAudioProcessor::exportKit(const juce::File& kitFolder, const juce::File& zipFile)
+{
+    KitExport result;
+    const auto kitName = kitFolder.getFileName();
+    auto presets = kitFolder.findChildFiles(juce::File::findFiles, false, "*" + presetExtension);
+    presets.sort();
+
+    juce::ZipFile::Builder zip;
+    std::map<juce::String, juce::String> copied;  // original sound path -> file name inside the kit
+    std::set<juce::String> usedNames;             // lower-case names already taken in Samples/
+
+    for (const auto& presetFile : presets)
+    {
+        auto xml = juce::parseXML(presetFile);
+        if (xml == nullptr) { result.missing.add(presetFile.getFileNameWithoutExtension() + ": couldn't read the preset"); continue; }
+
+        if (auto* samples = xml->getChildByName("Samples"))
+        {
+            for (int i = 0; i < kNumLayers; ++i)
+            {
+                const auto absKey = "layer" + juce::String(i), relKey = absKey + "_rel";
+                const auto abs = samples->getStringAttribute(absKey), rel = samples->getStringAttribute(relKey);
+                if (abs.isEmpty() && rel.isEmpty()) continue;
+
+                // Where's the sound? Its full path first, then relative to the preset (either separator)
+                juce::File source;
+                if (juce::File::isAbsolutePath(abs) && juce::File(abs).existsAsFile())
+                    source = juce::File(abs);
+                else if (rel.isNotEmpty())
+                {
+                    const auto candidate = presetFile.getParentDirectory().getChildFile(
+                        rel.replaceCharacter('\\', '/').replaceCharacter('/', juce::File::getSeparatorChar()));
+                    if (candidate.existsAsFile()) source = candidate;
+                }
+
+                samples->removeAttribute(absKey); // shared copies never contain your own folder paths
+                if (source == juce::File())
+                {
+                    samples->removeAttribute(relKey);
+                    result.missing.add(presetFile.getFileNameWithoutExtension() + ": sound " + juce::String(i + 1)
+                        + " (" + (abs.isNotEmpty() ? abs : rel) + ")");
+                    continue;
+                }
+
+                auto& name = copied[source.getFullPathName()];
+                if (name.isEmpty()) // first time we see this sound: give it a unique name in Samples/
+                {
+                    name = source.getFileName();
+                    for (int n = 2; usedNames.count(name.toLowerCase()) > 0; ++n)
+                        name = source.getFileNameWithoutExtension() + " (" + juce::String(n) + ")" + source.getFileExtension();
+                    usedNames.insert(name.toLowerCase());
+                    zip.addFile(source, 9, kitName + "/Samples/" + name);
+                }
+                samples->setAttribute(relKey, "Samples/" + name);
+            }
+        }
+
+        const auto text = xml->toString();
+        zip.addEntry(new juce::MemoryInputStream(juce::MemoryBlock(text.toRawUTF8(), text.getNumBytesAsUTF8()), true),
+            9, kitName + "/" + presetFile.getFileName(), presetFile.getLastModificationTime());
+        ++result.presets;
+    }
+
+    const juce::String readme =
+        "HOW TO INSTALL THIS KIT\n=======================\n\n"
+        "Easiest: in " JucePlugin_Name ", click \"kits\" > \"Import kit...\" and pick this zip.\n\n"
+        "Or by hand: unzip it and put the \"" + kitName + "\" folder inside " JucePlugin_Name "'s presets folder\n"
+        "(\"kits\" > \"Show presets folder\" opens it). Keep its Samples folder with it.\n";
+    zip.addEntry(new juce::MemoryInputStream(juce::MemoryBlock(readme.toRawUTF8(), readme.getNumBytesAsUTF8()), true),
+        9, kitName + "/How to install this kit.txt", juce::Time::getCurrentTime());
+
+    result.sounds = (int)copied.size();
+    zipFile.deleteFile();
+    juce::FileOutputStream out(zipFile);
+    if (!out.openedOk() || !zip.writeToStream(out, nullptr))
+        result.error = "Couldn't write " + zipFile.getFullPathName();
+    return result;
+}
+
+juce::Result AudioPluginAudioProcessor::importKit(const juce::File& zipFile, juce::String& kitNameOut)
+{
+    juce::ZipFile zip(zipFile);
+    if (zip.getNumEntries() == 0)
+        return juce::Result::fail("That doesn't look like a kit zip.");
+
+    // A kit zip has one top folder ("<kit>/..."). If it doesn't, unpack into a folder named after the zip.
+    juce::String top;
+    bool singleTopFolder = true;
+    for (int i = 0; i < zip.getNumEntries(); ++i)
+    {
+        const auto name = zip.getEntry(i)->filename.replaceCharacter('\\', '/');
+        const auto first = name.upToFirstOccurrenceOf("/", false, false);
+        if (!name.containsChar('/') || (top.isNotEmpty() && first != top)) { singleTopFolder = false; break; }
+        top = first;
+    }
+
+    const auto presetsFolder = getPresetFolder();
+    const auto target = singleTopFolder ? presetsFolder : presetsFolder.getChildFile(zipFile.getFileNameWithoutExtension());
+    kitNameOut = singleTopFolder ? top : zipFile.getFileNameWithoutExtension();
+    return zip.uncompressTo(target, true); // JUCE refuses entries that would land outside the folder
 }
 
 juce::AudioProcessorEditor* AudioPluginAudioProcessor::createEditor()

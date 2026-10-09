@@ -38,6 +38,17 @@ namespace Sketch
         juce::Image grain, paper;
     };
 
+    // Drag-to-copy: what's being dragged (settings of one sound) and helpers to start/read such a drag
+    struct CopyDrag
+    {
+        int fromSlot = -1;
+        juce::String what;          // shown to the user: "envelope", "volume", "delay"...
+        juce::StringArray names;    // parameter names without the slot prefix
+    };
+    void startCopyDrag(juce::Component& source, int fromSlot, const juce::String& what, const juce::StringArray& names);
+    bool readCopyDrag(const juce::var& description, CopyDrag& out);
+    bool splitSlotParam(const juce::String& paramID, int& slot, juce::String& name); // "l2_attack" -> 2, "attack"
+
     inline juce::uint32 seedFor(const void* p, juce::uint32 salt = 0)
     {
         return (juce::uint32)(((juce::pointer_sized_uint)p * 2654435761u) >> 3) ^ (salt * 40503u);
@@ -65,6 +76,8 @@ public:
     void drawCallOutBoxBackground(juce::CallOutBox&, juce::Graphics&, const juce::Path&, juce::Image&) override;
     juce::Component* getParentComponentForMenuOptions(const juce::PopupMenu::Options&) override;
     void drawBubble(juce::Graphics&, juce::BubbleComponent&, const juce::Point<float>& tip, const juce::Rectangle<float>& body) override;
+    void drawTooltip(juce::Graphics&, const juce::String& text, int width, int height) override;
+    juce::Rectangle<int> getTooltipBounds(const juce::String& text, juce::Point<int> screenPos, juce::Rectangle<int> parentArea) override;
     juce::Font getSliderPopupFont(juce::Slider&) override { return juce::FontOptions(16.0f); }
 
 private:
@@ -92,11 +105,18 @@ public:
     {
         double snapStep = 0.0;
         std::function<void()> onRightClick;
+        std::function<void()> onCopyDrag;   // set when this knob belongs to a sound (can be copied)
 
         double snapValue(double value, DragMode mode) override;
         void mouseDown(const juce::MouseEvent&) override;
-        void mouseDrag(const juce::MouseEvent& e) override { if (!e.mods.isPopupMenu()) Slider::mouseDrag(e); }
-        void mouseUp(const juce::MouseEvent& e) override { if (!e.mods.isPopupMenu()) Slider::mouseUp(e); }
+        void mouseDrag(const juce::MouseEvent&) override;
+        void mouseUp(const juce::MouseEvent&) override;
+        void mouseMove(const juce::MouseEvent&) override;
+        juce::String getTooltip() override;
+
+    private:
+        bool inLabel(juce::Point<int> p) const { return p.y >= getHeight() - 18; }
+        bool copyMode = false, copyStarted = false; // drag by the name (or Alt-drag) = copy, not turn
     };
     KnobSlider slider;
 
@@ -107,6 +127,32 @@ private:
     juce::String label;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> attachment;
     std::unique_ptr<juce::TextEditor> valueEditor;
+};
+
+//==============================================================================
+// A text button that also starts a drag when you pull it away (click still works as normal)
+struct DragButton : public juce::TextButton
+{
+    std::function<void()> onDragOut;
+
+    void mouseDrag(const juce::MouseEvent& e) override
+    {
+        if (!dragging && onDragOut != nullptr && e.getDistanceFromDragStart() > 6)
+        {
+            dragging = true;
+            onDragOut();
+        }
+        if (!dragging) TextButton::mouseDrag(e);
+    }
+
+    void mouseUp(const juce::MouseEvent& e) override
+    {
+        if (dragging) { dragging = false; setState(buttonNormal); return; } // a drag isn't a click
+        TextButton::mouseUp(e);
+    }
+
+private:
+    bool dragging = false;
 };
 
 //==============================================================================

@@ -7,9 +7,12 @@
 // One sound: number, waveform (drop zone), Volume + Pitch, Mute/Reverse,
 // and a row of buttons that pop up the rest (start, envelope, glide, arp) as little notes.
 class SlotStrip : public juce::Component,
-    public juce::FileDragAndDropTarget
+    public juce::FileDragAndDropTarget,
+    public juce::DragAndDropTarget,   // drop copied settings from another sound here
+    public juce::TooltipClient
 {
 public:
+    juce::String getTooltip() override; // only over the number
     SlotStrip(AudioPluginAudioProcessor&, int slot);
 
     void paint(juce::Graphics&) override;
@@ -22,7 +25,13 @@ public:
     void filesDropped(const juce::StringArray&, int, int) override;
 
     void poll(); // called at 60 Hz by the editor
+
+    bool isInterestedInDragSource(const SourceDetails&) override;
+    void itemDragEnter(const SourceDetails&) override;
+    void itemDragExit(const SourceDetails&) override;
+    void itemDropped(const SourceDetails&) override;
     void mouseMove(const juce::MouseEvent&) override;
+    void mouseExit(const juce::MouseEvent&) override;
 
     // Layer linking: clicking the number reports here; the editor runs the "pick a target" step
     std::function<void(int slot)> onNumberClicked;
@@ -32,12 +41,13 @@ public:
 private:
     struct PopupButton
     {
-        juce::TextButton button;
+        DragButton button;   // click = open the note, drag onto another sound = copy these settings
         std::function<std::unique_ptr<ControlPanel>()> makePanel;
         std::function<bool()> isLit; // highlighted while that feature is in use
     };
 
-    void addPopup(const juce::String& name, std::function<void(ControlPanel&)> build, std::function<bool()> isLit);
+    void addPopup(const juce::String& name, std::function<void(ControlPanel&)> build, std::function<bool()> isLit,
+        const juce::String& title = {}); // title defaults to the button's name
     bool paramOn(const juce::String& name) const;
     bool anyChanged(std::initializer_list<const char*> names) const;
     void rebuildWaveImage();
@@ -46,7 +56,7 @@ private:
     const int index;
     const juce::Colour colour;
 
-    SketchKnob volume, pitch;
+    SketchKnob volume, pitch, highPass, lowPass;
     juce::ToggleButton muteButton{ "mute" }, reverseButton{ "reverse" };
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> muteAtt, reverseAtt;
     juce::TextButton clearButton{ "x" };
@@ -63,6 +73,8 @@ private:
     enum class MuteState { off, layerOnly, silent } muteState = MuteState::off;
     float shownLoopStart = 0.0f, shownLoopEnd = 1.0f;
     int linkSource = -1;
+    bool numberHover = false;
+    Sketch::CopyDrag copyHover;   // a copy being dragged over this sound (fromSlot -1 = none)
     int seenTriggers = 0;
 
     struct Playhead { float pos, level; };
@@ -72,31 +84,54 @@ private:
     std::unique_ptr<juce::FileChooser> chooser;
 };
 
-// Header preset controls:  < [preset list] >  Save
+// A hand-drawn die. Every click rolls a new face (and the owner loads a random preset).
+class DiceButton : public juce::Button
+{
+public:
+    DiceButton() : juce::Button("random preset") { setTooltip("Random preset"); }
+    void paintButton(juce::Graphics&, bool highlighted, bool down) override;
+    void clicked() override;
+
+private:
+    int face = 5;
+    float tilt = -0.08f;
+};
+
+// Header preset controls:  < [preset list] >  dice  Save  kits
 class PresetBar : public juce::Component
 {
 public:
     explicit PresetBar(AudioPluginAudioProcessor&);
     void resized() override;
-    void refresh();                    // rescan the preset folder and show the current name
-    void poll();                       // picks up a name change from the host (e.g. project reload)
+    void refresh();                    // rescan the presets folder (and kits) and show the current preset
+    void poll();                       // picks up a change from the host (e.g. project reload)
 
 private:
-    enum { initId = 1, firstFileId = 2, openId = 10000, folderId = 10001 };
+    enum { initId = 1, firstFileId = 2, emptyKitBaseId = 20000, openId = 30000 };
 
     void step(int delta);
+    void randomPreset();
     void save();
     void open();
+    void showKitsMenu();
+    void createKit();
+    void exportKit(const juce::File& kit);
+    void importKit();
+    void changeFolder();
+    void showMessage(const juce::String& title, const juce::String& body);
 
     AudioPluginAudioProcessor& proc;
-    juce::TextButton prevButton{ "<" }, nextButton{ ">" }, saveButton{ "Save" };
+    juce::TextButton prevButton{ "<" }, nextButton{ ">" }, saveButton{ "Save" }, kitsButton{ "kits" };
+    DiceButton dice;
     juce::ComboBox box;
-    juce::Array<juce::File> files;
+    juce::Array<juce::File> files;     // every preset: top level first, then each kit's
     juce::String shownName;
+    juce::File shownFile;
     std::unique_ptr<juce::FileChooser> chooser;
 };
 
 class AudioPluginAudioProcessorEditor : public juce::AudioProcessorEditor,
+    public juce::DragAndDropContainer, // drag-to-copy between sounds
     public Sketch::NoteHost,
     private juce::Timer
 {
@@ -137,6 +172,10 @@ private:
         AudioPluginAudioProcessorEditor& editor;
     };
     LinkOverlay linkOverlay{ *this };
+    std::array<int, kNumLayers* kNumLayers> seenLinkFires{};
+    std::array<float, kNumLayers* kNumLayers> linkFlash{};   // 1 = just fired, fades to 0
+    bool linkWasFlashing = false;
+    juce::TooltipWindow tooltips{ this, 600 };                 // inside the plugin window, not a desktop window
     int linkSource = -1;            // sound whose number was clicked first, -1 = not linking
     juce::uint32 shownLinks = 0;
     juce::Rectangle<int> hintArea;

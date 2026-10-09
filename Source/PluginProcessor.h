@@ -75,14 +75,34 @@ public:
 
     // Presets (message thread). Files are XML with the ".preset" extension.
     static inline const juce::String presetExtension{ ".preset" };
-    static juce::File getPresetFolder();   // Documents/<plugin name>/Presets, created if missing
+    static juce::File getPresetFolder();        // the user's choice, else Documents/<plugin name>/Presets; created if missing
+    static juce::File getDefaultPresetFolder();
+    static void setPresetFolder(const juce::File& folder); // remembered across sessions; File() = back to default
+    static bool usingCustomPresetFolder();
     bool savePreset(const juce::File& file);
     bool loadPreset(const juce::File& file);
     void initPreset();                     // all defaults, no samples
     juce::String currentPresetName;        // empty = unsaved / init
+    juce::File currentPresetFile;          // the loaded/saved preset file, if known (message thread)
+
+    // Kits: subfolders of the presets folder. An exported kit is a zip of "<kit>/<presets>" plus
+    // "<kit>/Samples/<every sound they use>", with the presets re-pointed at those copies.
+    // Copy settings from one sound to another (drag-to-copy). Names are parameter names without
+    // the slot prefix ("attack", "dist_drive", ...); "@layers" copies outgoing layer links.
+    void copySettings(int fromSlot, int toSlot, const juce::StringArray& names);
+    juce::StringArray settingNamesWithPrefix(int slot, const juce::String& prefix) const; // e.g. every "dist_" setting
+
+    static juce::Array<juce::File> getKitFolders();
+    static juce::File createKit(const juce::String& name);                 // returns the new folder
+    struct KitExport { int presets = 0, sounds = 0; juce::StringArray missing; juce::String error; };
+    static KitExport exportKit(const juce::File& kitFolder, const juce::File& zipFile);
+    static juce::Result importKit(const juce::File& zipFile, juce::String& kitNameOut);
 
     // Bumped on the audio thread each time a slot is picked; the UI uses it to flash that slot.
     std::array<std::atomic<int>, kNumLayers> triggerCount{};
+
+    // Bumped each time a layer link fires ([from * kNumLayers + to]); the UI flashes that arrow.
+    std::array<std::atomic<int>, kNumLayers* kNumLayers> linkFireCount{};
 
     // Per-voice playhead for the UI: which slot, where in the sample (0..1, playback direction), how loud (0 = not sounding)
     std::array<std::atomic<int>, kNumVoices>   playheadSlot{};
@@ -192,13 +212,20 @@ private:
         DelayFx delay;
         juce::Reverb reverb;
         std::array<bool, 4> wasOn{}; // reset an effect's memory when it's switched on
+
+        // Per-sound high-pass / low-pass, before the effects. Frequencies glide so sweeps don't zipper.
+        juce::dsp::StateVariableTPTFilter<float> hp, lp;
+        juce::SmoothedValue<float, juce::ValueSmoothingTypes::Multiplicative> hpFreq{ 20.0f }, lpFreq{ 20000.0f };
+        juce::SmoothedValue<float> hpMix, lpMix; // 5 ms crossfade when a filter switches on/off: no clicks
+        bool hpActive = false, lpActive = false;
     };
     struct FxParamPtrs
     {
         std::atomic<float>* distOn, * distType, * distDrive, * distTone, * distMix,
             * grOn, * grSize, * grDensity, * grSpray, * grPitch, * grMix,
             * dlyOn, * dlyTime, * dlyFb, * dlyMix, * dlyPing,
-            * revOn, * revSize, * revDamp, * revWidth, * revMix;
+            * revOn, * revSize, * revDamp, * revWidth, * revMix,
+            * hpf, * lpf;
     };
     void processSlotFx(int slot, int numSamples);
 

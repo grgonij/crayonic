@@ -4,10 +4,14 @@
 SlotStrip::SlotStrip(AudioPluginAudioProcessor& p, int slot)
     : proc(p), index(slot), colour(Theme::slotColour(slot)),
     volume(p.apvts, layerParamID(slot, "vol"), "volume", " dB", colour),
-    pitch(p.apvts, layerParamID(slot, "pitch"), "pitch", " st", colour, 1.0) // snaps to semitones
+    pitch(p.apvts, layerParamID(slot, "pitch"), "pitch", " st", colour, 1.0), // snaps to semitones
+    highPass(p.apvts, layerParamID(slot, "hpf"), "hi pass", "", colour),     // values read "off" / "120 Hz"
+    lowPass(p.apvts, layerParamID(slot, "lpf"), "lo pass", "", colour)
 {
     addAndMakeVisible(volume);
     addAndMakeVisible(pitch);
+    addAndMakeVisible(highPass);
+    addAndMakeVisible(lowPass);
 
     for (auto* b : { &muteButton, &reverseButton })
     {
@@ -57,6 +61,22 @@ SlotStrip::SlotStrip(AudioPluginAudioProcessor& p, int slot)
         },
         [this] { return paramOn("loop"); });
 
+    addPopup("layers", [this](ControlPanel& c)
+        {
+            // One checkbox per other sound: "picking this one also plays..."
+            for (int j = 0; j < kNumLayers; ++j)
+                if (j != index)
+                    c.addToggle(linkParamID(index, j), "sound " + juce::String(j + 1));
+        },
+        [this]
+        {
+            for (int j = 0; j < kNumLayers; ++j)
+                if (j != index && proc.apvts.getRawParameterValue(linkParamID(index, j))->load() > 0.5f)
+                    return true;
+            return false;
+        },
+        "also play these with it");
+
     addPopup("arp", [id](ControlPanel& c)
         {
             c.addToggle(id("arp"), "arp on");
@@ -73,15 +93,28 @@ SlotStrip::SlotStrip(AudioPluginAudioProcessor& p, int slot)
     poll();
 }
 
-void SlotStrip::addPopup(const juce::String& name, std::function<void(ControlPanel&)> build, std::function<bool()> isLit)
+// Which settings each tab copies when it's dragged onto another sound
+static juce::StringArray tabCopyNames(const juce::String& tab)
+{
+    if (tab == "start")    return { "start", "startrand", "stretch" };
+    if (tab == "envelope") return { "attack", "decay", "sustain", "release" };
+    if (tab == "glide")    return { "glide", "legato", "glidetime" };
+    if (tab == "loop")     return { "loop", "loopstart", "loopend" };
+    if (tab == "layers")   return { "@layers" };
+    if (tab == "arp")      return { "arp", "arprate", "arppattern", "arpoct", "arpgate", "arpswing", "arpvel" };
+    return {};
+}
+
+void SlotStrip::addPopup(const juce::String& name, std::function<void(ControlPanel&)> build, std::function<bool()> isLit,
+    const juce::String& title)
 {
     auto popup = std::make_unique<PopupButton>();
     popup->button.setButtonText(name);
     popup->button.setColour(juce::TextButton::buttonOnColourId, colour);
     popup->isLit = std::move(isLit);
-    popup->makePanel = [this, name, build = std::move(build)]
+    popup->makePanel = [this, panelTitle = title.isNotEmpty() ? title : name, build = std::move(build)]
         {
-            auto panel = std::make_unique<ControlPanel>(proc.apvts, colour, name);
+            auto panel = std::make_unique<ControlPanel>(proc.apvts, colour, panelTitle);
             build(*panel);
             panel->finish();
             return panel;
@@ -93,6 +126,9 @@ void SlotStrip::addPopup(const juce::String& name, std::function<void(ControlPan
             // A note pops out under the button; clicking anywhere else closes it
             Sketch::showNote(raw->button, raw->makePanel());
         };
+
+    raw->button.onDragOut = [this, raw, name] { Sketch::startCopyDrag(raw->button, index, name, tabCopyNames(name)); };
+    raw->button.setTooltip("Click to open. Drag onto another sound to copy these settings.");
 
     addAndMakeVisible(raw->button);
     popups.push_back(std::move(popup));
@@ -273,6 +309,12 @@ void SlotStrip::paint(juce::Graphics& g)
         ring.addEllipse(numberArea.toFloat().withSizeKeepingCentre(38.0f, 44.0f));
         Sketch::stroke(g, ring, colour.darker(0.3f).withAlpha(flash), 2.4f, seed + 9, 2);
     }
+    if (linkSource < 0) // always a light pencil circle, so the number reads as something to click
+    {
+        juce::Path ring;
+        ring.addEllipse(numberArea.toFloat().withSizeKeepingCentre(40.0f, 46.0f));
+        Sketch::stroke(g, ring, Theme::ink.withAlpha(numberHover ? 0.55f : 0.2f), numberHover ? 1.8f : 1.2f, seed + 14, 2);
+    }
     if (linkSource >= 0) // linking: the chosen sound is circled firmly, the others faintly (pick one)
     {
         juce::Path ring;
@@ -382,6 +424,21 @@ void SlotStrip::paint(juce::Graphics& g)
     if (dragOver)
         Sketch::stroke(g, Sketch::roundedRect(wa.expanded(4.0f), 9.0f), colour.darker(0.35f), 3.0f, seed + 5);
 
+    if (copyHover.fromSlot >= 0) // a copy is hovering: outline this sound and say what will happen
+    {
+        const auto ink = Theme::slotColour(copyHover.fromSlot).darker(0.5f);
+        Sketch::stroke(g, Sketch::roundedRect(getLocalBounds().toFloat().reduced(3.0f), 10.0f), ink, 3.0f, seed + 15, 2);
+        const auto text = "drop to copy " + copyHover.what + " from sound " + juce::String(copyHover.fromSlot + 1);
+        const int w = juce::GlyphArrangement::getStringWidthInt(juce::FontOptions(19.0f), text) + 28;
+        const auto box = waveArea.withSizeKeepingCentre(w, 32).toFloat();
+        g.setColour(Theme::paper.withAlpha(0.95f));
+        g.fillRoundedRectangle(box, 7.0f);
+        Sketch::stroke(g, Sketch::roundedRect(box, 7.0f), ink, 1.6f, seed + 16, 2, 0.4f);
+        g.setColour(Theme::ink);
+        g.setFont(19.0f);
+        g.drawText(text, box, juce::Justification::centred);
+    }
+
     juce::Path divider; // notebook-style rule between sounds
     divider.startNewSubPath(10.0f, (float)getHeight() - 1.5f);
     divider.lineTo((float)getWidth() - 10.0f, (float)getHeight() - 1.5f);
@@ -400,9 +457,11 @@ void SlotStrip::resized()
     reverseButton.setBounds(toggles.withSizeKeepingCentre(92, 28));
     r.removeFromRight(6);
 
-    auto knobs = r.removeFromRight(2 * SketchKnob::kWidth);
+    auto knobs = r.removeFromRight(4 * SketchKnob::kWidth);
     volume.setBounds(knobs.removeFromLeft(SketchKnob::kWidth).withSizeKeepingCentre(SketchKnob::kWidth, SketchKnob::kHeight));
-    pitch.setBounds(knobs.withSizeKeepingCentre(SketchKnob::kWidth, SketchKnob::kHeight));
+    pitch.setBounds(knobs.removeFromLeft(SketchKnob::kWidth).withSizeKeepingCentre(SketchKnob::kWidth, SketchKnob::kHeight));
+    highPass.setBounds(knobs.removeFromLeft(SketchKnob::kWidth).withSizeKeepingCentre(SketchKnob::kWidth, SketchKnob::kHeight));
+    lowPass.setBounds(knobs.withSizeKeepingCentre(SketchKnob::kWidth, SketchKnob::kHeight));
     r.removeFromRight(14);
 
     auto tabs = r.removeFromBottom(28);
@@ -422,8 +481,33 @@ void SlotStrip::resized()
 
 void SlotStrip::mouseMove(const juce::MouseEvent& e)
 {
-    setMouseCursor(numberArea.contains(e.getPosition()) ? juce::MouseCursor::PointingHandCursor
-        : juce::MouseCursor::NormalCursor);
+    const bool over = numberArea.contains(e.getPosition());
+    setMouseCursor(over ? juce::MouseCursor::PointingHandCursor : juce::MouseCursor::NormalCursor);
+    if (over != numberHover)
+    {
+        numberHover = over;
+        repaint(numberArea.expanded(8));
+    }
+}
+
+void SlotStrip::mouseExit(const juce::MouseEvent&)
+{
+    if (numberHover)
+    {
+        numberHover = false;
+        repaint(numberArea.expanded(8));
+    }
+}
+
+juce::String SlotStrip::getTooltip()
+{
+    if (!numberArea.contains(getMouseXYRelative()))
+        return {};
+    if (linkSource == index)
+        return "Click again to cancel";
+    if (linkSource >= 0)
+        return "Click to make sound " + juce::String(linkSource + 1) + " also play this one (click again to unlink)";
+    return "Click this number, then another sound's number, to layer them: whenever this one is picked, that one plays too";
 }
 
 void SlotStrip::setLinkMode(int sourceSlot)
@@ -456,6 +540,36 @@ void SlotStrip::mouseDown(const juce::MouseEvent& e)
         });
 }
 
+bool SlotStrip::isInterestedInDragSource(const SourceDetails& details)
+{
+    Sketch::CopyDrag drag;
+    return Sketch::readCopyDrag(details.description, drag) && drag.fromSlot != index; // not onto itself
+}
+
+void SlotStrip::itemDragEnter(const SourceDetails& details)
+{
+    Sketch::readCopyDrag(details.description, copyHover);
+    repaint();
+}
+
+void SlotStrip::itemDragExit(const SourceDetails&)
+{
+    copyHover = {};
+    repaint();
+}
+
+void SlotStrip::itemDropped(const SourceDetails& details)
+{
+    Sketch::CopyDrag drag;
+    if (Sketch::readCopyDrag(details.description, drag))
+    {
+        proc.copySettings(drag.fromSlot, index, drag.names);
+        flash = 1.0f; // the number gets circled: "copied here"
+    }
+    copyHover = {};
+    repaint();
+}
+
 bool SlotStrip::isInterestedInFileDrag(const juce::StringArray& files)
 {
     for (const auto& f : files)
@@ -485,24 +599,144 @@ void SlotStrip::filesDropped(const juce::StringArray& files, int, int)
 }
 
 //==============================================================================
+namespace
+{
+    // Little note for naming a new kit: a text box and a "create" button
+    struct KitNameNote : public juce::Component
+    {
+        explicit KitNameNote(std::function<void(const juce::String&)> onCreate) : create(std::move(onCreate))
+        {
+            for (auto id : { juce::TextEditor::backgroundColourId, juce::TextEditor::focusedOutlineColourId })
+                editor.setColour(id, id == juce::TextEditor::backgroundColourId ? Theme::paper : Theme::lavender.darker(0.4f));
+            editor.setColour(juce::TextEditor::textColourId, Theme::ink);
+            editor.setColour(juce::TextEditor::outlineColourId, Theme::ink.withAlpha(0.5f));
+            editor.setColour(juce::TextEditor::highlightColourId, Theme::lavender.withAlpha(0.6f));
+            editor.setFont(juce::FontOptions(18.0f));
+            editor.setTextToShowWhenEmpty("kit name", Theme::ink.withAlpha(0.4f));
+            editor.onReturnKey = [this] { submit(); };
+            addAndMakeVisible(editor);
+            button.onClick = [this] { submit(); };
+            addAndMakeVisible(button);
+            setSize(290, 92);
+        }
+
+        void submit()
+        {
+            if (editor.getText().trim().isEmpty()) return;
+            const auto name = editor.getText();
+            if (auto* box = findParentComponentOfClass<juce::CallOutBox>()) box->dismiss();
+            create(name);
+        }
+
+        void visibilityChanged() override { if (isShowing()) editor.grabKeyboardFocus(); }
+
+        void paint(juce::Graphics& g) override
+        {
+            g.setColour(Theme::ink);
+            g.setFont(20.0f);
+            g.drawText("new kit", 12, 2, getWidth() - 24, 24, juce::Justification::centredLeft);
+        }
+
+        void resized() override
+        {
+            auto r = getLocalBounds().reduced(12, 0).withTrimmedTop(32).withTrimmedBottom(10);
+            button.setBounds(r.removeFromRight(74));
+            r.removeFromRight(8);
+            editor.setBounds(r);
+        }
+
+        std::function<void(const juce::String&)> create;
+        juce::TextEditor editor;
+        juce::TextButton button{ "create" };
+    };
+
+    // Little note that just tells you something (export/import results)
+    struct MessageNote : public juce::Component
+    {
+        MessageNote(juce::String t, juce::String b) : title(std::move(t)), body(std::move(b))
+        {
+            juce::AttributedString text;
+            text.append(body, juce::FontOptions(17.0f), Theme::ink);
+            layout.createLayout(text, 340.0f);
+            setSize(364, 40 + (int)std::ceil(layout.getHeight()) + 12);
+        }
+        void paint(juce::Graphics& g) override
+        {
+            g.setColour(Theme::ink);
+            g.setFont(20.0f);
+            g.drawText(title, 12, 4, getWidth() - 24, 26, juce::Justification::centredLeft);
+            layout.draw(g, { 12.0f, 38.0f, 340.0f, (float)getHeight() - 44.0f });
+        }
+        juce::String title, body;
+        juce::TextLayout layout;
+    };
+}
+
+//==============================================================================
+void DiceButton::clicked()
+{
+    juce::Random rng;
+    int next = face;
+    while (next == face) next = 1 + rng.nextInt(6);  // always a visibly different face
+    face = next;
+    tilt = (rng.nextFloat() - 0.5f) * 0.35f;             // lands at a slightly different angle each roll
+    repaint();
+}
+
+void DiceButton::paintButton(juce::Graphics& g, bool highlighted, bool down)
+{
+    const auto b = getLocalBounds().toFloat();
+    const float size = juce::jmin(b.getWidth(), b.getHeight()) - 7.0f;
+    const auto c = b.getCentre();
+    const auto spin = juce::AffineTransform::rotation(tilt, c.x, c.y);
+    const auto seed = Sketch::seedFor(this, (juce::uint32)face);
+
+    juce::Path body;
+    body.addRoundedRectangle(c.x - size * 0.5f, c.y - size * 0.5f, size, size, size * 0.22f);
+    body.applyTransform(spin);
+    const auto colour = down ? Theme::lavender.darker(0.15f) : highlighted ? Theme::lavender : Theme::lavender.interpolatedWith(Theme::paper, 0.35f);
+    Sketch::fill(g, body, colour, seed);
+    Sketch::stroke(g, body, Theme::ink.withAlpha(highlighted ? 0.95f : 0.75f), 1.4f, seed + 1, 2);
+
+    // Pip layouts for faces 1-6, in a -1..1 grid
+    static constexpr float pips[6][6][2] = {
+        { { 0, 0 } },
+        { { -1, -1 }, { 1, 1 } },
+        { { -1, -1 }, { 0, 0 }, { 1, 1 } },
+        { { -1, -1 }, { 1, -1 }, { -1, 1 }, { 1, 1 } },
+        { { -1, -1 }, { 1, -1 }, { 0, 0 }, { -1, 1 }, { 1, 1 } },
+        { { -1, -1 }, { 1, -1 }, { -1, 0 }, { 1, 0 }, { -1, 1 }, { 1, 1 } } };
+    const float spacing = size * 0.27f, r = size * 0.085f;
+    g.setColour(Theme::ink.withAlpha(0.85f));
+    for (int i = 0; i < face; ++i)
+    {
+        auto pt = juce::Point<float>(c.x + pips[face - 1][i][0] * spacing, c.y + pips[face - 1][i][1] * spacing).transformedBy(spin);
+        g.fillEllipse(pt.x - r, pt.y - r, r * 2.0f, r * 2.0f);
+    }
+}
+
+//==============================================================================
 PresetBar::PresetBar(AudioPluginAudioProcessor& p) : proc(p)
 {
-    for (auto* b : { &prevButton, &nextButton, &saveButton })
+    for (auto* b : { &prevButton, &nextButton, &saveButton, &kitsButton })
         addAndMakeVisible(*b);
+    addAndMakeVisible(dice);
     addAndMakeVisible(box);
 
     prevButton.onClick = [this] { step(-1); };
     nextButton.onClick = [this] { step(+1); };
+    dice.onClick = [this] { randomPreset(); };
     saveButton.onClick = [this] { save(); };
+    kitsButton.onClick = [this] { showKitsMenu(); };
+    kitsButton.setTooltip("Create, export and import kits; choose the presets folder");
 
     box.setTextWhenNothingSelected("Init");
     box.onChange = [this]
         {
             const int id = box.getSelectedId();
-            if (id == initId)                                    proc.initPreset();
-            else if (id >= firstFileId && id < firstFileId + files.size()) proc.loadPreset(files[id - firstFileId]);
+            if (id == initId)                                               proc.initPreset();
+            else if (id >= firstFileId && id < firstFileId + files.size())  proc.loadPreset(files[id - firstFileId]);
             else if (id == openId) { open(); return; }
-            else if (id == folderId)                             AudioPluginAudioProcessor::getPresetFolder().startAsProcess();
             refresh();
         };
 
@@ -511,56 +745,99 @@ PresetBar::PresetBar(AudioPluginAudioProcessor& p) : proc(p)
 
 void PresetBar::refresh()
 {
-    files = AudioPluginAudioProcessor::getPresetFolder().findChildFiles(
-        juce::File::findFiles, false, "*" + AudioPluginAudioProcessor::presetExtension);
-    files.sort();
-
+    const auto ext = "*" + AudioPluginAudioProcessor::presetExtension;
+    files.clear();
     box.clear(juce::dontSendNotification);
-    box.addItem("Init", initId);
-    box.addSeparator();
-    for (int i = 0; i < files.size(); ++i)
-        box.addItem(files[i].getFileNameWithoutExtension(), firstFileId + i);
-    box.addSeparator();
-    box.addItem("Open preset file...", openId);
-    box.addItem("Show preset folder", folderId);
+    auto* menu = box.getRootMenu();
+    menu->addItem(initId, "Init");
+    menu->addSeparator();
 
+    auto top = AudioPluginAudioProcessor::getPresetFolder().findChildFiles(juce::File::findFiles, false, ext);
+    top.sort();
+    for (const auto& f : top)
+    {
+        files.add(f);
+        menu->addItem(firstFileId + files.size() - 1, f.getFileNameWithoutExtension());
+    }
+
+    // Each kit is a submenu
+    const auto kits = AudioPluginAudioProcessor::getKitFolders();
+    if (!kits.isEmpty()) menu->addSeparator();
+    for (int k = 0; k < kits.size(); ++k)
+    {
+        juce::PopupMenu sub;
+        auto kitPresets = kits[k].findChildFiles(juce::File::findFiles, false, ext);
+        kitPresets.sort();
+        for (const auto& f : kitPresets)
+        {
+            files.add(f);
+            sub.addItem(firstFileId + files.size() - 1, f.getFileNameWithoutExtension());
+        }
+        if (kitPresets.isEmpty())
+            sub.addItem(emptyKitBaseId + k, "(empty - save presets into this folder)", false);
+        menu->addSubMenu(kits[k].getFileName(), sub);
+    }
+
+    menu->addSeparator();
+    menu->addItem(openId, "Open preset file...");
+
+    // Show the current preset: by file if we know it, else by name (e.g. after reopening a project)
     shownName = proc.currentPresetName;
-    int match = 0;
-    for (int i = 0; i < files.size(); ++i)
-        if (files[i].getFileNameWithoutExtension() == shownName)
-            match = firstFileId + i;
+    shownFile = proc.currentPresetFile;
+    int match = files.indexOf(shownFile);
+    if (match < 0 && shownName.isNotEmpty())
+        for (int i = 0; i < files.size() && match < 0; ++i)
+            if (files[i].getFileNameWithoutExtension() == shownName) match = i;
 
-    if (match != 0)               box.setSelectedId(match, juce::dontSendNotification);
+    if (match >= 0)
+    {
+        const auto& f = files[match];
+        const bool inKit = f.getParentDirectory() != AudioPluginAudioProcessor::getPresetFolder();
+        box.setText(inKit ? f.getParentDirectory().getFileName() + " / " + f.getFileNameWithoutExtension()
+            : f.getFileNameWithoutExtension(), juce::dontSendNotification);
+    }
     else if (shownName.isEmpty()) box.setSelectedId(initId, juce::dontSendNotification);
     else                          box.setText(shownName, juce::dontSendNotification); // loaded from elsewhere
 }
 
 void PresetBar::poll()
 {
-    if (proc.currentPresetName != shownName)
+    if (proc.currentPresetName != shownName || proc.currentPresetFile != shownFile)
         refresh();
 }
 
 void PresetBar::step(int delta)
 {
     if (files.isEmpty()) return;
-
-    int index = -1;
-    for (int i = 0; i < files.size(); ++i)
-        if (files[i].getFileNameWithoutExtension() == proc.currentPresetName)
-            index = i;
-
+    int index = files.indexOf(proc.currentPresetFile);
     index = index < 0 ? (delta > 0 ? 0 : files.size() - 1)
-        : (index + delta + files.size()) % files.size(); // wrap around
+        : (index + delta + files.size()) % files.size(); // wrap around, through all kits
     proc.loadPreset(files[index]);
+    refresh();
+}
+
+void PresetBar::randomPreset()
+{
+    if (files.isEmpty())
+    {
+        showMessage("no presets yet", "Save a preset first - then the dice can pick from your library.");
+        return;
+    }
+    const int current = files.indexOf(proc.currentPresetFile);
+    int pick = juce::Random::getSystemRandom().nextInt(files.size());
+    if (files.size() > 1)
+        while (pick == current) pick = juce::Random::getSystemRandom().nextInt(files.size());
+    proc.loadPreset(files[pick]);
     refresh();
 }
 
 void PresetBar::save()
 {
+    // Save next to the current preset (so presets made from a kit stay in that kit)
+    const auto presetsFolder = AudioPluginAudioProcessor::getPresetFolder();
+    const auto folder = proc.currentPresetFile.isAChildOf(presetsFolder) ? proc.currentPresetFile.getParentDirectory() : presetsFolder;
     const auto name = proc.currentPresetName.isNotEmpty() ? proc.currentPresetName : juce::String("My Preset");
-    chooser = std::make_unique<juce::FileChooser>(
-        "Save preset", AudioPluginAudioProcessor::getPresetFolder().getChildFile(name + AudioPluginAudioProcessor::presetExtension),
+    chooser = std::make_unique<juce::FileChooser>("Save preset", folder.getChildFile(name + AudioPluginAudioProcessor::presetExtension),
         "*" + AudioPluginAudioProcessor::presetExtension);
 
     chooser->launchAsync(juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::canSelectFiles
@@ -587,11 +864,127 @@ void PresetBar::open()
         });
 }
 
+//==============================================================================
+void PresetBar::showKitsMenu()
+{
+    enum { createId = 1, importId, showFolderId, changeFolderId, defaultFolderId, exportBaseId = 100 };
+
+    const auto kits = AudioPluginAudioProcessor::getKitFolders();
+    juce::PopupMenu exportMenu;
+    for (int k = 0; k < kits.size(); ++k)
+        exportMenu.addItem(exportBaseId + k, kits[k].getFileName());
+    if (kits.isEmpty())
+        exportMenu.addItem(exportBaseId - 1, "(no kits yet)", false);
+
+    juce::PopupMenu menu;
+    menu.addItem(createId, "Create kit...");
+    menu.addSubMenu("Export kit", exportMenu);
+    menu.addItem(importId, "Import kit...");
+    menu.addSeparator();
+    menu.addItem(showFolderId, "Show presets folder");
+    menu.addItem(changeFolderId, "Change presets folder...");
+    menu.addItem(defaultFolderId, "Use the default presets folder", AudioPluginAudioProcessor::usingCustomPresetFolder());
+
+    menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&kitsButton),
+        [safe = juce::Component::SafePointer<PresetBar>(this), kits](int result)
+        {
+            if (safe == nullptr || result == 0) return;
+            if (result == createId)             safe->createKit();
+            else if (result == importId)        safe->importKit();
+            else if (result == showFolderId)    AudioPluginAudioProcessor::getPresetFolder().startAsProcess();
+            else if (result == changeFolderId)  safe->changeFolder();
+            else if (result == defaultFolderId) { AudioPluginAudioProcessor::setPresetFolder({}); safe->refresh(); }
+            else if (result >= exportBaseId && result - exportBaseId < kits.size())
+                safe->exportKit(kits[result - exportBaseId]);
+        });
+}
+
+void PresetBar::createKit()
+{
+    Sketch::showNote(kitsButton, std::make_unique<KitNameNote>(
+        [safe = juce::Component::SafePointer<PresetBar>(this)](const juce::String& name)
+        {
+            const auto folder = AudioPluginAudioProcessor::createKit(name);
+            if (safe == nullptr) return;
+            safe->refresh();
+            safe->showMessage("kit created", "\"" + folder.getFileName() + "\" is ready. Save presets into it "
+                "(Save remembers the folder you're working in), then use kits > Export kit to share it.");
+        }));
+}
+
+void PresetBar::exportKit(const juce::File& kit)
+{
+    const auto desktop = juce::File::getSpecialLocation(juce::File::userDesktopDirectory);
+    chooser = std::make_unique<juce::FileChooser>("Export kit", desktop.getChildFile(kit.getFileName() + ".zip"), "*.zip");
+    chooser->launchAsync(juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::canSelectFiles
+        | juce::FileBrowserComponent::warnAboutOverwriting,
+        [this, kit](const juce::FileChooser& fc)
+        {
+            const auto zip = fc.getResult();
+            if (zip == juce::File()) return;
+            const auto target = zip.withFileExtension(".zip");
+
+            juce::MouseCursor::showWaitCursor();
+            const auto r = AudioPluginAudioProcessor::exportKit(kit, target);
+            juce::MouseCursor::hideWaitCursor();
+
+            if (r.error.isNotEmpty()) { showMessage("export failed", r.error); return; }
+            juce::String body = juce::String(r.presets) + " presets and " + juce::String(r.sounds)
+                + " sounds packed into " + target.getFileName() + ".";
+            if (!r.missing.isEmpty())
+                body << "\n\nThese sounds couldn't be found (those slots will be empty):\n- "
+                << r.missing.joinIntoString("\n- ");
+            showMessage("kit exported", body);
+            target.revealToUser();
+        });
+}
+
+void PresetBar::importKit()
+{
+    chooser = std::make_unique<juce::FileChooser>("Import kit", juce::File::getSpecialLocation(juce::File::userDesktopDirectory), "*.zip");
+    chooser->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
+        [this](const juce::FileChooser& fc)
+        {
+            if (!fc.getResult().existsAsFile()) return;
+            juce::String kitName;
+            juce::MouseCursor::showWaitCursor();
+            const auto r = AudioPluginAudioProcessor::importKit(fc.getResult(), kitName);
+            juce::MouseCursor::hideWaitCursor();
+            refresh();
+            showMessage(r.wasOk() ? "kit imported" : "import failed",
+                r.wasOk() ? "\"" + kitName + "\" is in your preset list now." : r.getErrorMessage());
+        });
+}
+
+void PresetBar::changeFolder()
+{
+    chooser = std::make_unique<juce::FileChooser>("Choose a presets folder", AudioPluginAudioProcessor::getPresetFolder());
+    chooser->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectDirectories,
+        [this](const juce::FileChooser& fc)
+        {
+            const auto folder = fc.getResult();
+            if (!folder.isDirectory()) return;
+            AudioPluginAudioProcessor::setPresetFolder(folder);
+            refresh();
+            showMessage("presets folder changed", "Presets and kits now live in:\n" + folder.getFullPathName()
+                + "\n\nExisting presets weren't moved - copy them over if you want them here.");
+        });
+}
+
+void PresetBar::showMessage(const juce::String& title, const juce::String& body)
+{
+    Sketch::showNote(kitsButton, std::make_unique<MessageNote>(title, body));
+}
+
 void PresetBar::resized()
 {
     auto r = getLocalBounds();
-    saveButton.setBounds(r.removeFromRight(64));
-    r.removeFromRight(8);
+    kitsButton.setBounds(r.removeFromRight(58));
+    r.removeFromRight(6);
+    saveButton.setBounds(r.removeFromRight(58));
+    r.removeFromRight(6);
+    dice.setBounds(r.removeFromRight(38).withSizeKeepingCentre(38, 38));
+    r.removeFromRight(6);
     prevButton.setBounds(r.removeFromLeft(28));
     nextButton.setBounds(r.removeFromRight(28));
     box.setBounds(r.reduced(4, 0));
@@ -624,6 +1017,8 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor(AudioPluginAudi
 
     for (auto& s : strips)
         s->onNumberClicked = [this](int slot) { numberClicked(slot); };
+    for (size_t i = 0; i < seenLinkFires.size(); ++i)
+        seenLinkFires[i] = processorRef.linkFireCount[i].load();
 
     for (auto* tab : { &soundsTab, &fxTab })
     {
@@ -635,7 +1030,7 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor(AudioPluginAudi
     soundsTab.onClick = [this] { showFx(false); };
     fxTab.onClick = [this] { showFx(true); };
 
-    setSize(900, 620);
+    setSize(1000, 620);
     startTimerHz(60); // smooth playheads
 }
 
@@ -750,6 +1145,9 @@ void AudioPluginAudioProcessorEditor::LinkOverlay::paint(juce::Graphics& g)
             arrow.lineTo(end);
             arrow.lineTo(end.translated(-6.0f, 4.0f));
 
+            if (const float flash = editor.linkFlash[(size_t)(from * kNumLayers + to)]; flash > 0.0f)
+                Sketch::stroke(g, arrow, Theme::slotColour(from).withAlpha(0.8f * flash), 2.0f + 5.0f * flash,
+                    Sketch::seedFor(this, (juce::uint32)(from * 8 + to + 100)), 2, 0.6f); // glow while it plays
             Sketch::stroke(g, arrow, Theme::slotColour(from).darker(0.35f), 2.0f,
                 Sketch::seedFor(this, (juce::uint32)(from * 8 + to)), 2, 0.5f);
         }
@@ -779,6 +1177,18 @@ void AudioPluginAudioProcessorEditor::timerCallback()
         shownLinks = mask;
         linkOverlay.repaint();
     }
+
+    // Flash an arrow each time its layer fires, then let it fade
+    bool flashing = false;
+    for (size_t i = 0; i < linkFlash.size(); ++i)
+    {
+        const int fires = processorRef.linkFireCount[i].load();
+        if (fires != seenLinkFires[i]) { seenLinkFires[i] = fires; linkFlash[i] = 1.0f; }
+        if (linkFlash[i] > 0.0f) { linkFlash[i] = juce::jmax(0.0f, linkFlash[i] - 0.05f); flashing = true; }
+    }
+    if (flashing || linkWasFlashing)
+        linkOverlay.repaint();
+    linkWasFlashing = flashing;
     if (soundsView.isVisible())
         for (auto& s : strips) s->poll();
     else
@@ -820,7 +1230,7 @@ void AudioPluginAudioProcessorEditor::resized()
     soundsTab.setBounds(header.removeFromRight(84).withSizeKeepingCentre(84, 34));
     header.removeFromRight(18);
     masterKnob.setBounds(header.removeFromRight(SketchKnob::kWidth).withSizeKeepingCentre(SketchKnob::kWidth, SketchKnob::kHeight));
-    presetBar.setBounds(header.removeFromLeft(420).withSizeKeepingCentre(420, 34));
+    presetBar.setBounds(header.removeFromLeft(500).withSizeKeepingCentre(500, 38));
     hintArea = header.reduced(8, 0);
 
     r.reduce(8, 0);

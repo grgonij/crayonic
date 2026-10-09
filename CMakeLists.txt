@@ -17,7 +17,7 @@ juce_add_plugin(MyPlugin
     NEEDS_MIDI_INPUT TRUE         # receives notes from the piano roll
     NEEDS_MIDI_OUTPUT FALSE
     FORMATS VST3 AU Standalone
-    PRODUCT_NAME "TEST")
+    PRODUCT_NAME "crayonic")
 
 target_sources(MyPlugin PRIVATE
     Source/PluginProcessor.cpp

@@ -272,6 +272,27 @@ juce::Component* SketchLookAndFeel::getParentComponentForMenuOptions(const juce:
     return LookAndFeel_V4::getParentComponentForMenuOptions(options);
 }
 
+void SketchLookAndFeel::drawTooltip(juce::Graphics& g, const juce::String& text, int width, int height)
+{
+    const auto r = juce::Rectangle<float>(0.0f, 0.0f, (float)width, (float)height);
+    Sketch::paper(g, r.toNearestInt());
+    g.setColour(Theme::ink.withAlpha(0.7f));
+    g.drawRect(r, 1.0f);
+    g.setColour(Theme::ink);
+    g.setFont(16.0f);
+    g.drawFittedText(text, r.reduced(8.0f, 3.0f).toNearestInt(), juce::Justification::centredLeft, 3, 1.0f); // wrap, never squash
+}
+
+juce::Rectangle<int> SketchLookAndFeel::getTooltipBounds(const juce::String& text, juce::Point<int> pos, juce::Rectangle<int> area)
+{
+    const int textW = juce::GlyphArrangement::getStringWidthInt(juce::FontOptions(16.0f), text);
+    const int w = juce::jmin(300, textW + 20);
+    const int lines = juce::jlimit(1, 3, (int)std::ceil((float)textW / 270.0f));
+    const int h = 8 + lines * 19;
+    return juce::Rectangle<int>(pos.x > area.getCentreX() ? pos.x - (w + 12) : pos.x + 18,
+        pos.y > area.getCentreY() ? pos.y - (h + 8) : pos.y + 18, w, h).constrainedWithin(area);
+}
+
 void SketchLookAndFeel::drawBubble(juce::Graphics& g, juce::BubbleComponent&, const juce::Point<float>& tip,
     const juce::Rectangle<float>& body)
 {
@@ -291,6 +312,18 @@ SketchKnob::SketchKnob(juce::AudioProcessorValueTreeState& state, const juce::St
 {
     slider.snapStep = snapStep;
     slider.onRightClick = [this] { showValueEditor(); };
+
+    // Knobs that belong to a sound ("l2_attack") can be dragged by their name onto another sound to copy
+    int slot = -1;
+    juce::String name;
+    if (Sketch::splitSlotParam(paramID, slot, name))
+    {
+        // Describe it by its full parameter name ("Slot 1 Delay Mix" -> "delay mix"), clearer than just "mix"
+        juce::String what = label;
+        if (auto* param = state.getParameter(paramID))
+            what = param->getName(64).fromFirstOccurrenceOf("Slot " + juce::String(slot + 1) + " ", false, false).toLowerCase();
+        slider.onCopyDrag = [this, slot, name, what] { Sketch::startCopyDrag(*this, slot, what, { name }); };
+    }
     slider.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
     slider.setTextBoxStyle(juce::Slider::NoTextBox, true, 0, 0);
     slider.setTextValueSuffix(suffix);
@@ -304,6 +337,51 @@ SketchKnob::SketchKnob(juce::AudioProcessorValueTreeState& state, const juce::St
         slider.setDoubleClickReturnValue(true, param->convertFrom0to1(param->getDefaultValue()));
 
     setSize(kWidth, kHeight);
+}
+
+void Sketch::startCopyDrag(juce::Component& source, int fromSlot, const juce::String& what, const juce::StringArray& names)
+{
+    auto* container = juce::DragAndDropContainer::findParentDragContainerFor(&source);
+    if (container == nullptr || container->isDragAndDropActive() || names.isEmpty()) return;
+
+    // A little paper tag that follows the mouse: "copy envelope"
+    const auto text = "copy " + what;
+    const int w = juce::GlyphArrangement::getStringWidthInt(juce::FontOptions(17.0f), text) + 26, h = 28;
+    juce::Image tag(juce::Image::ARGB, w * 2, h * 2, true, juce::SoftwareImageType());
+    {
+        juce::Graphics g(tag);
+        g.addTransform(juce::AffineTransform::scale(2.0f));
+        const auto r = juce::Rectangle<float>(1.0f, 1.0f, (float)w - 2.0f, (float)h - 2.0f);
+        g.setColour(Theme::paper);
+        g.fillRoundedRectangle(r, 6.0f);
+        Sketch::stroke(g, Sketch::roundedRect(r, 6.0f), Theme::slotColour(fromSlot).darker(0.5f), 1.6f, 77u, 2, 0.4f);
+        g.setColour(Theme::ink);
+        g.setFont(17.0f);
+        g.drawText(text, r, juce::Justification::centred);
+    }
+
+    const juce::String description = "copy\n" + juce::String(fromSlot) + "\n" + what + "\n" + names.joinIntoString(",");
+    const juce::Point<int> offset(-w / 2, -h - 6); // tag sits just above the pointer, so the target stays visible
+    container->startDragging(description, &source, juce::ScaledImage(tag, 2.0), false, &offset);
+}
+
+bool Sketch::readCopyDrag(const juce::var& description, CopyDrag& out)
+{
+    const auto parts = juce::StringArray::fromLines(description.toString());
+    if (parts.size() != 4 || parts[0] != "copy") return false;
+    out.fromSlot = parts[1].getIntValue();
+    out.what = parts[2];
+    out.names = juce::StringArray::fromTokens(parts[3], ",", {});
+    return out.fromSlot >= 0 && !out.names.isEmpty();
+}
+
+bool Sketch::splitSlotParam(const juce::String& paramID, int& slot, juce::String& name)
+{
+    if (paramID.length() < 4 || paramID[0] != 'l' || !juce::CharacterFunctions::isDigit(paramID[1]) || paramID[2] != '_')
+        return false;
+    slot = paramID[1] - '0';
+    name = paramID.substring(3);
+    return true;
 }
 
 double SketchKnob::KnobSlider::snapValue(double value, DragMode mode)
@@ -320,7 +398,44 @@ void SketchKnob::KnobSlider::mouseDown(const juce::MouseEvent& e)
         if (onRightClick) onRightClick();
         return;
     }
-    Slider::mouseDown(e);
+    // Grabbing the knob's name (or Alt/Option + anywhere) picks up a copy instead of turning it
+    copyMode = onCopyDrag != nullptr && (inLabel(e.getPosition()) || e.mods.isAltDown());
+    copyStarted = false;
+    if (!copyMode) Slider::mouseDown(e);
+}
+
+void SketchKnob::KnobSlider::mouseDrag(const juce::MouseEvent& e)
+{
+    if (copyMode)
+    {
+        if (!copyStarted && e.getDistanceFromDragStart() > 4)
+        {
+            copyStarted = true;
+            onCopyDrag();
+        }
+        return;
+    }
+    if (!e.mods.isPopupMenu()) Slider::mouseDrag(e);
+}
+
+void SketchKnob::KnobSlider::mouseUp(const juce::MouseEvent& e)
+{
+    if (copyMode) { copyMode = copyStarted = false; return; }
+    if (!e.mods.isPopupMenu()) Slider::mouseUp(e);
+}
+
+void SketchKnob::KnobSlider::mouseMove(const juce::MouseEvent& e)
+{
+    Slider::mouseMove(e);
+    setMouseCursor(onCopyDrag != nullptr && inLabel(e.getPosition()) ? juce::MouseCursor::DraggingHandCursor
+        : juce::MouseCursor::NormalCursor);
+}
+
+juce::String SketchKnob::KnobSlider::getTooltip()
+{
+    if (onCopyDrag != nullptr && inLabel(getMouseXYRelative()))
+        return "Drag this name onto another sound to copy the setting (or Alt-drag the knob)";
+    return {};
 }
 
 void SketchKnob::showValueEditor()

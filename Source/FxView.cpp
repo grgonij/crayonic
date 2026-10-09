@@ -2,7 +2,7 @@
 
 FxCard::FxCard(AudioPluginAudioProcessor& p, int slot, const juce::String& n, const juce::String& prefix,
     std::function<void(ControlPanel&)> build)
-    : proc(p), colour(Theme::slotColour(slot)), name(n), buildPanel(std::move(build)),
+    : proc(p), slot(slot), prefix(prefix), colour(Theme::slotColour(slot)), name(n), buildPanel(std::move(build)),
     onToggle(n),
     mix(p.apvts, layerParamID(slot, prefix + "_mix"), "mix", " %", colour)
 {
@@ -14,6 +14,9 @@ FxCard::FxCard(AudioPluginAudioProcessor& p, int slot, const juce::String& n, co
 
     addAndMakeVisible(mix);
     addAndMakeVisible(tweakButton);
+    tweakButton.setButtonText("tweak");
+    tweakButton.onDragOut = [this] { startDrag(tweakButton); };
+    setTooltip("Drag this card onto another sound's row to copy the whole " + n);
     tweakButton.onClick = [this]
         {
             auto panel = std::make_unique<ControlPanel>(proc.apvts, colour, name);
@@ -21,6 +24,20 @@ FxCard::FxCard(AudioPluginAudioProcessor& p, int slot, const juce::String& n, co
             panel->finish();
             Sketch::showNote(tweakButton, std::move(panel));
         };
+}
+
+void FxCard::mouseDrag(const juce::MouseEvent& e)
+{
+    if (!dragStarted && e.getDistanceFromDragStart() > 6)
+    {
+        dragStarted = true;
+        startDrag(*this);
+    }
+}
+
+void FxCard::startDrag(juce::Component& source)
+{
+    Sketch::startCopyDrag(source, slot, name, proc.settingNamesWithPrefix(slot, prefix + "_")); // every setting of this effect
 }
 
 void FxCard::paint(juce::Graphics& g)
@@ -93,6 +110,40 @@ void FxRow::poll()
         sampleName = current ? juce::File(current->path).getFileNameWithoutExtension() : juce::String("(empty)");
         repaint(nameArea);
     }
+}
+
+bool FxRow::isInterestedInDragSource(const SourceDetails& details)
+{
+    Sketch::CopyDrag drag;
+    return Sketch::readCopyDrag(details.description, drag) && drag.fromSlot != slot;
+}
+
+void FxRow::itemDragEnter(const SourceDetails& details) { Sketch::readCopyDrag(details.description, copyHover); repaint(); }
+void FxRow::itemDragExit(const SourceDetails&) { copyHover = {}; repaint(); }
+
+void FxRow::itemDropped(const SourceDetails& details)
+{
+    Sketch::CopyDrag drag;
+    if (Sketch::readCopyDrag(details.description, drag))
+        proc.copySettings(drag.fromSlot, slot, drag.names);
+    copyHover = {};
+    repaint();
+}
+
+void FxRow::paintOverChildren(juce::Graphics& g)
+{
+    if (copyHover.fromSlot < 0) return;
+    const auto ink = Theme::slotColour(copyHover.fromSlot).darker(0.5f);
+    Sketch::stroke(g, Sketch::roundedRect(getLocalBounds().toFloat().reduced(3.0f), 10.0f), ink, 3.0f, Sketch::seedFor(this, 15), 2);
+    const auto text = "drop to copy " + copyHover.what + " from sound " + juce::String(copyHover.fromSlot + 1);
+    const int w = juce::GlyphArrangement::getStringWidthInt(juce::FontOptions(19.0f), text) + 28;
+    const auto box = getLocalBounds().withSizeKeepingCentre(w, 32).toFloat();
+    g.setColour(Theme::paper.withAlpha(0.95f));
+    g.fillRoundedRectangle(box, 7.0f);
+    Sketch::stroke(g, Sketch::roundedRect(box, 7.0f), ink, 1.6f, Sketch::seedFor(this, 16), 2, 0.4f);
+    g.setColour(Theme::ink);
+    g.setFont(19.0f);
+    g.drawText(text, box, juce::Justification::centred);
 }
 
 void FxRow::paint(juce::Graphics& g)
