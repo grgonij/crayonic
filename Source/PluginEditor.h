@@ -4,6 +4,38 @@
 #include "Sketch.h"
 #include "FxView.h"
 
+// Draws and edits a sound's volume shape on top of its waveform (like an FL automation clip):
+// click = add a point, drag = move, right-click = remove, drag a small circle = bend, double-click it = straighten.
+class ShapeEditor : public juce::Component
+{
+public:
+    ShapeEditor(AudioPluginAudioProcessor&, int slot, juce::Colour);
+    void refresh();                              // re-read the shape (e.g. after loading a preset)
+    bool isDragging() const { return dragPoint >= 0 || dragHandle >= 0; }
+
+    void paint(juce::Graphics&) override;
+    void mouseDown(const juce::MouseEvent&) override;
+    void mouseDrag(const juce::MouseEvent&) override;
+    void mouseUp(const juce::MouseEvent&) override { dragPoint = dragHandle = -1; }
+    void mouseDoubleClick(const juce::MouseEvent&) override;
+    void mouseMove(const juce::MouseEvent&) override;
+
+private:
+    juce::Rectangle<float> plot() const { return getLocalBounds().toFloat().reduced(2.0f, 6.0f); }
+    juce::Point<float> toScreen(float x, float y) const;
+    juce::Point<float> handlePos(size_t segment) const;
+    int pointAt(juce::Point<float>) const;
+    int handleAt(juce::Point<float>) const;
+    void commit();
+
+    AudioPluginAudioProcessor& proc;
+    const int slot;
+    const juce::Colour colour;
+    std::vector<ShapePoint> pts;
+    int dragPoint = -1, dragHandle = -1;
+    float bendAtStart = 0.0f, mouseYAtStart = 0.0f;
+};
+
 // One sound: number, waveform (drop zone), Volume + Pitch, Mute/Reverse,
 // and a row of buttons that pop up the rest (start, envelope, glide, arp) as little notes.
 class SlotStrip : public juce::Component,
@@ -60,6 +92,11 @@ private:
     juce::ToggleButton muteButton{ "mute" }, reverseButton{ "reverse" };
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> muteAtt, reverseAtt;
     juce::TextButton clearButton{ "x" };
+    ShapeEditor shapeEditor;
+    DragButton shapeButton;       // click = edit the volume shape, drag onto another sound = copy it
+    bool editingShape = false;
+    ShapePtr shownShape;
+    void setEditingShape(bool);
     std::vector<std::unique_ptr<PopupButton>> popups;
 
     juce::Rectangle<int> numberArea, waveArea;

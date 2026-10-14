@@ -37,6 +37,31 @@ struct Sample
 };
 using SamplePtr = std::shared_ptr<const Sample>;
 
+// Volume shape drawn on a sound's waveform (like an FL automation clip). x = position in the sound
+// (0..1, as displayed), y = volume (1 = unchanged, 0 = silent), bend = curve of the segment to the
+// next point (-1..1, positive bulges upward).
+struct ShapePoint { float x = 0.0f, y = 1.0f, bend = 0.0f; };
+
+struct VolumeShape
+{
+    std::vector<ShapePoint> points;
+    std::array<float, 1024> table{};  // precomputed, so the audio thread just looks values up
+    bool flat = true;                  // all at full volume: nothing to do
+
+    static std::vector<ShapePoint> defaultPoints() { return { { 0.0f, 1.0f, 0.0f }, { 1.0f, 1.0f, 0.0f } }; }
+    static float segmentValue(const ShapePoint& a, const ShapePoint& b, float t);
+    static float evaluate(const std::vector<ShapePoint>& points, float x);
+
+    float valueAt(float x) const
+    {
+        const float f = juce::jlimit(0.0f, 1.0f, x) * 1023.0f;
+        const int i = (int)f;
+        const float a = table[(size_t)i], b = table[(size_t)juce::jmin(i + 1, 1023)];
+        return a + (f - (float)i) * (b - a);
+    }
+};
+using ShapePtr = std::shared_ptr<const VolumeShape>;
+
 class AudioPluginAudioProcessor : public juce::AudioProcessor,
     private juce::Timer
 {
@@ -87,6 +112,11 @@ public:
 
     // Kits: subfolders of the presets folder. An exported kit is a zip of "<kit>/<presets>" plus
     // "<kit>/Samples/<every sound they use>", with the presets re-pointed at those copies.
+    // Volume shapes (message thread). Points are kept sorted, first at x = 0 and last at x = 1.
+    std::vector<ShapePoint> getShapePoints(int slot) const;
+    void setShapePoints(int slot, std::vector<ShapePoint> points);
+    ShapePtr getShape(int slot) const { return std::atomic_load(&shapes[(size_t)slot]); }
+
     // Copy settings from one sound to another (drag-to-copy). Names are parameter names without
     // the slot prefix ("attack", "dist_drive", ...); "@layers" copies outgoing layer links.
     void copySettings(int fromSlot, int toSlot, const juce::StringArray& names);
@@ -130,6 +160,7 @@ private:
         std::array<bool, kNumLayers> links{};      // links[j]: picking this sound also plays sound j
         float glideMs = 0.0f;
         juce::ADSR::Parameters env;
+        const VolumeShape* shape = nullptr;   // kept alive for the block by processBlock
 
         bool arp = false;
         double arpBeats = 0.25;   // step length in quarter notes
@@ -191,6 +222,8 @@ private:
 
     std::array<SamplePtr, kNumLayers> samples;   // swapped atomically
     std::vector<SamplePtr> retired;              // keeps old samples alive until audio thread lets go
+    std::array<ShapePtr, kNumLayers> shapes;     // swapped atomically, like the samples
+    std::vector<ShapePtr> retiredShapes;
     juce::CriticalSection retiredLock;
 
     std::array<Voice, kNumVoices> voices;
@@ -217,6 +250,7 @@ private:
         juce::dsp::StateVariableTPTFilter<float> hp, lp;
         juce::SmoothedValue<float, juce::ValueSmoothingTypes::Multiplicative> hpFreq{ 20.0f }, lpFreq{ 20000.0f };
         juce::SmoothedValue<float> hpMix, lpMix; // 5 ms crossfade when a filter switches on/off: no clicks
+        juce::SmoothedValue<float> pan, width;   // last in the chain, smoothed so turning them never clicks
         bool hpActive = false, lpActive = false;
     };
     struct FxParamPtrs
@@ -225,7 +259,7 @@ private:
             * grOn, * grSize, * grDensity, * grSpray, * grPitch, * grMix,
             * dlyOn, * dlyTime, * dlyFb, * dlyMix, * dlyPing,
             * revOn, * revSize, * revDamp, * revWidth, * revMix,
-            * hpf, * lpf;
+            * hpf, * lpf, * pan, * width;
     };
     void processSlotFx(int slot, int numSamples);
 

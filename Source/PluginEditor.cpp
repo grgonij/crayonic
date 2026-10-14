@@ -6,7 +6,8 @@ SlotStrip::SlotStrip(AudioPluginAudioProcessor& p, int slot)
     volume(p.apvts, layerParamID(slot, "vol"), "volume", " dB", colour),
     pitch(p.apvts, layerParamID(slot, "pitch"), "pitch", " st", colour, 1.0), // snaps to semitones
     highPass(p.apvts, layerParamID(slot, "hpf"), "hi pass", "", colour),     // values read "off" / "120 Hz"
-    lowPass(p.apvts, layerParamID(slot, "lpf"), "lo pass", "", colour)
+    lowPass(p.apvts, layerParamID(slot, "lpf"), "lo pass", "", colour),
+    shapeEditor(p, slot, colour)
 {
     addAndMakeVisible(volume);
     addAndMakeVisible(pitch);
@@ -20,6 +21,14 @@ SlotStrip::SlotStrip(AudioPluginAudioProcessor& p, int slot)
     }
     muteAtt = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(proc.apvts, layerParamID(index, "mute"), muteButton);
     reverseAtt = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(proc.apvts, layerParamID(index, "reverse"), reverseButton);
+
+    addChildComponent(shapeEditor);
+    shapeButton.setButtonText("shape");
+    shapeButton.setColour(juce::TextButton::buttonOnColourId, colour);
+    shapeButton.setTooltip("Draw a volume shape on the waveform. Drag onto another sound to copy it.");
+    shapeButton.onClick = [this] { setEditingShape(!editingShape); };
+    shapeButton.onDragOut = [this] { Sketch::startCopyDrag(shapeButton, index, "shape", { "@shape" }); };
+    addAndMakeVisible(shapeButton);
 
     addChildComponent(clearButton);
     clearButton.setTooltip("Remove this sound");
@@ -61,6 +70,14 @@ SlotStrip::SlotStrip(AudioPluginAudioProcessor& p, int slot)
         },
         [this] { return paramOn("loop"); });
 
+    addPopup("pan", [id](ControlPanel& c)
+        {
+            c.addKnob(id("pan"), "pan");
+            c.addKnob(id("width"), "stereo", " %");
+        },
+        [this] { return anyChanged({ "pan", "width" }); },
+        "pan and stereo");
+
     addPopup("layers", [this](ControlPanel& c)
         {
             // One checkbox per other sound: "picking this one also plays..."
@@ -101,6 +118,7 @@ static juce::StringArray tabCopyNames(const juce::String& tab)
     if (tab == "glide")    return { "glide", "legato", "glidetime" };
     if (tab == "loop")     return { "loop", "loopstart", "loopend" };
     if (tab == "layers")   return { "@layers" };
+    if (tab == "pan")      return { "pan", "width" };
     if (tab == "arp")      return { "arp", "arprate", "arppattern", "arpoct", "arpgate", "arpswing", "arpvel" };
     return {};
 }
@@ -157,9 +175,19 @@ void SlotStrip::poll()
     {
         shownSample = current;
         sampleName = current ? juce::File(current->path).getFileNameWithoutExtension() : juce::String();
-        clearButton.setVisible(current != nullptr);
+        clearButton.setVisible(current != nullptr && !editingShape);
         redrawWave = true;
     }
+
+    if (auto shape = proc.getShape(index); shape != shownShape)
+    {
+        shownShape = shape;
+        if (!shapeEditor.isDragging()) shapeEditor.refresh();
+        redrawWave = true;
+    }
+    const bool shaped = shownShape != nullptr && !shownShape->flat;
+    if (shapeButton.getToggleState() != (shaped || editingShape))
+        shapeButton.setToggleState(shaped || editingShape, juce::dontSendNotification);
 
     const bool reverse = paramOn("reverse");
     if (reverse != shownReverse)
@@ -291,6 +319,22 @@ void SlotStrip::rebuildWaveImage()
     wave.closeSubPath();
 
     const auto seed = Sketch::seedFor(this, 7);
+    if (shownShape != nullptr && !shownShape->flat)
+    {
+        // With a volume shape: the original stays faint, the shaped sound is drawn solid on top
+        g.setColour(colour.withAlpha(0.28f));
+        g.fillPath(wave);
+
+        juce::Path shaped;
+        shaped.startNewSubPath(0.0f, mid);
+        auto gainAt = [&](int i) { return shownShape->valueAt((float)i / (float)(n - 1)); };
+        for (int i = 0; i < n; ++i)      shaped.lineTo(xAt(i), mid - juce::jmax(0.01f, peaks[(size_t)i] * gainAt(i)) * amp);
+        for (int i = n - 1; i >= 0; --i) shaped.lineTo(xAt(i), mid + juce::jmax(0.01f, peaks[(size_t)i] * gainAt(i)) * amp);
+        shaped.closeSubPath();
+        Sketch::fill(g, shaped, colour, seed);
+        Sketch::stroke(g, shaped, colour.darker(0.45f), 1.1f, seed + 1, 2, 0.6f);
+        return;
+    }
     Sketch::fill(g, wave, colour, seed);
     Sketch::stroke(g, wave, colour.darker(0.45f), 1.1f, seed + 1, 2, 0.6f);
 }
@@ -379,6 +423,21 @@ void SlotStrip::paint(juce::Graphics& g)
                 g.setFont(15.0f);
                 g.drawText("loop", juce::Rectangle<float>(x0, b - 18.0f, x1 - x0, 16.0f), juce::Justification::centred);
             }
+        }
+
+        // A volume shape, shown lightly when not being edited (the editor draws it otherwise)
+        if (!editingShape && shownShape != nullptr && !shownShape->flat)
+        {
+            juce::Path curve;
+            const auto plot = wa.reduced(2.0f, 6.0f);
+            for (int px = 0; px <= (int)plot.getWidth(); px += 2)
+            {
+                const float x = (float)px / plot.getWidth();
+                const juce::Point<float> pt(plot.getX() + (float)px, plot.getBottom() - shownShape->valueAt(x) * plot.getHeight());
+                if (px == 0) curve.startNewSubPath(pt); else curve.lineTo(pt);
+            }
+            g.setColour(Theme::ink.withAlpha(0.35f));
+            g.strokePath(curve, juce::PathStrokeType(1.4f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
         }
 
         // Playheads: soft colour wash with a charcoal line, fading with the envelope
@@ -475,8 +534,192 @@ void SlotStrip::resized()
         tabs.removeFromLeft(6);
     }
 
+    {
+        const int w = juce::GlyphArrangement::getStringWidthInt(juce::FontOptions(17.0f), "shape") + 26;
+        shapeButton.setBounds(tabs.removeFromLeft(w));
+    }
+    shapeEditor.setBounds(waveArea);
     clearButton.setBounds(waveArea.getRight() - 24, waveArea.getY() + 1, 24, 24);
     rebuildWaveImage();
+}
+
+void SlotStrip::setEditingShape(bool shouldEdit)
+{
+    editingShape = shouldEdit;
+    shapeButton.setButtonText(editingShape ? "done" : "shape");
+    shapeEditor.refresh();
+    shapeEditor.setVisible(editingShape);
+    clearButton.setVisible(!editingShape && shownSample != nullptr);
+    shapeButton.setToggleState(editingShape || (shownShape != nullptr && !shownShape->flat), juce::dontSendNotification);
+    repaint();
+}
+
+//==============================================================================
+ShapeEditor::ShapeEditor(AudioPluginAudioProcessor& p, int s, juce::Colour c) : proc(p), slot(s), colour(c)
+{
+    refresh();
+}
+
+void ShapeEditor::refresh()
+{
+    pts = proc.getShapePoints(slot);
+    repaint();
+}
+
+juce::Point<float> ShapeEditor::toScreen(float x, float y) const
+{
+    const auto r = plot();
+    return { r.getX() + x * r.getWidth(), r.getBottom() - y * r.getHeight() };
+}
+
+juce::Point<float> ShapeEditor::handlePos(size_t i) const
+{
+    const float x = 0.5f * (pts[i].x + pts[i + 1].x);
+    return toScreen(x, VolumeShape::segmentValue(pts[i], pts[i + 1], 0.5f));
+}
+
+int ShapeEditor::pointAt(juce::Point<float> m) const
+{
+    for (size_t i = 0; i < pts.size(); ++i)
+        if (toScreen(pts[i].x, pts[i].y).getDistanceFrom(m) < 9.0f) return (int)i;
+    return -1;
+}
+
+int ShapeEditor::handleAt(juce::Point<float> m) const
+{
+    for (size_t i = 0; i + 1 < pts.size(); ++i)
+        if (handlePos(i).getDistanceFrom(m) < 8.0f) return (int)i;
+    return -1;
+}
+
+void ShapeEditor::commit()
+{
+    proc.setShapePoints(slot, pts);
+    repaint();
+}
+
+void ShapeEditor::mouseDown(const juce::MouseEvent& e)
+{
+    const auto m = e.position;
+    const int hit = pointAt(m);
+
+    if (e.mods.isPopupMenu()) // right-click a point to remove it (the two ends stay)
+    {
+        if (hit > 0 && hit < (int)pts.size() - 1)
+        {
+            pts.erase(pts.begin() + hit);
+            commit();
+        }
+        return;
+    }
+
+    if (hit >= 0) { dragPoint = hit; return; }
+
+    if (const int h = handleAt(m); h >= 0)
+    {
+        dragHandle = h;
+        bendAtStart = pts[(size_t)h].bend;
+        mouseYAtStart = m.y;
+        return;
+    }
+
+    // Click on empty space: add a point there and keep dragging it
+    const auto r = plot();
+    ShapePoint p{ juce::jlimit(0.0f, 1.0f, (m.x - r.getX()) / r.getWidth()),
+                   juce::jlimit(0.0f, 1.0f, (r.getBottom() - m.y) / r.getHeight()), 0.0f };
+    auto it = std::upper_bound(pts.begin(), pts.end(), p.x, [](float x, const ShapePoint& q) { return x < q.x; });
+    if (it == pts.begin()) ++it;           // never in front of the first point
+    if (it == pts.end()) --it;             // never after the last one
+    dragPoint = (int)(pts.insert(it, p) - pts.begin());
+    commit();
+}
+
+void ShapeEditor::mouseDrag(const juce::MouseEvent& e)
+{
+    const auto r = plot();
+    if (dragPoint >= 0)
+    {
+        auto& p = pts[(size_t)dragPoint];
+        p.y = juce::jlimit(0.0f, 1.0f, (r.getBottom() - e.position.y) / r.getHeight());
+        const bool isEnd = dragPoint == 0 || dragPoint == (int)pts.size() - 1;
+        if (!isEnd) // inner points move freely, but never past their neighbours
+            p.x = juce::jlimit(pts[(size_t)dragPoint - 1].x + 0.002f, pts[(size_t)dragPoint + 1].x - 0.002f,
+                (e.position.x - r.getX()) / r.getWidth());
+        commit();
+    }
+    else if (dragHandle >= 0) // up = bulge up, down = sag down
+    {
+        pts[(size_t)dragHandle].bend = juce::jlimit(-1.0f, 1.0f, bendAtStart + (mouseYAtStart - e.position.y) / 80.0f);
+        commit();
+    }
+}
+
+void ShapeEditor::mouseDoubleClick(const juce::MouseEvent& e)
+{
+    if (const int h = handleAt(e.position); h >= 0) // straighten a curved segment
+    {
+        pts[(size_t)h].bend = 0.0f;
+        commit();
+    }
+}
+
+void ShapeEditor::mouseMove(const juce::MouseEvent& e)
+{
+    setMouseCursor(pointAt(e.position) >= 0 ? juce::MouseCursor::DraggingHandCursor
+        : handleAt(e.position) >= 0 ? juce::MouseCursor::UpDownResizeCursor
+        : juce::MouseCursor::CrosshairCursor);
+}
+
+void ShapeEditor::paint(juce::Graphics& g)
+{
+    const auto r = plot();
+
+    // Light wash over the part being turned down
+    juce::Path curve, above;
+    for (int px = 0; px <= (int)r.getWidth(); ++px)
+    {
+        const float x = (float)px / r.getWidth();
+        const auto pt = toScreen(x, VolumeShape::evaluate(pts, x));
+        if (px == 0) { curve.startNewSubPath(pt); above.startNewSubPath(r.getX(), r.getY()); }
+        curve.lineTo(pt);
+        above.lineTo(pt);
+    }
+    above.lineTo(r.getRight(), r.getY());
+    above.closeSubPath();
+    g.setColour(Theme::paper.withAlpha(0.35f));
+    g.fillPath(above);
+
+    g.setColour(Theme::ink.withAlpha(0.85f));
+    g.strokePath(curve, juce::PathStrokeType(2.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+
+    // Bend handles (small, hollow) between points
+    for (size_t i = 0; i + 1 < pts.size(); ++i)
+    {
+        const auto h = handlePos(i);
+        g.setColour(Theme::paper);
+        g.fillEllipse(h.x - 4.5f, h.y - 4.5f, 9.0f, 9.0f);
+        g.setColour(Theme::ink.withAlpha(0.6f));
+        g.drawEllipse(h.x - 4.5f, h.y - 4.5f, 9.0f, 9.0f, 1.3f);
+    }
+
+    // Points (filled in the sound's colour)
+    for (const auto& p : pts)
+    {
+        const auto c = toScreen(p.x, p.y);
+        g.setColour(colour);
+        g.fillEllipse(c.x - 6.0f, c.y - 6.0f, 12.0f, 12.0f);
+        g.setColour(Theme::ink);
+        g.drawEllipse(c.x - 6.0f, c.y - 6.0f, 12.0f, 12.0f, 1.5f);
+    }
+
+    // How it works, until the shape has more than its two ends
+    if (pts.size() <= 2)
+    {
+        const juce::String hint = "click to add a point  -  drag to move  -  right-click to remove  -  drag a small circle to bend";
+        g.setColour(Theme::ink.withAlpha(0.55f));
+        g.setFont(15.0f);
+        g.drawFittedText(hint, getLocalBounds().reduced(8, 4).removeFromBottom(20), juce::Justification::centred, 1, 1.0f);
+    }
 }
 
 void SlotStrip::mouseMove(const juce::MouseEvent& e)

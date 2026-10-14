@@ -44,10 +44,12 @@ AudioPluginAudioProcessor::AudioPluginAudioProcessor()
                             get("gr_on"), get("gr_size"), get("gr_density"), get("gr_spray"), get("gr_pitch"), get("gr_mix"),
                             get("dly_on"), get("dly_time"), get("dly_fb"), get("dly_mix"), get("dly_ping"),
                             get("rev_on"), get("rev_size"), get("rev_damp"), get("rev_width"), get("rev_mix"),
-                            get("hpf"), get("lpf") };
+                            get("hpf"), get("lpf"), get("pan"), get("width") };
     }
     masterParam = apvts.getRawParameterValue("master");
     keyArps.fill(0);
+    for (int l = 0; l < kNumLayers; ++l)
+        setShapePoints(l, {}); // flat: no volume shape
 
     startTimer(1000); // cleans up retired samples
 }
@@ -103,6 +105,15 @@ juce::AudioProcessorValueTreeState::ParameterLayout AudioPluginAudioProcessor::c
             juce::ParameterID{ layerParamID(l, "lpf"), 1 }, name + "Low-pass", freqRange(), 20000.0f,
             juce::AudioParameterFloatAttributes().withStringFromValueFunction(freqText(false))
             .withValueFromStringFunction([freqParse](const juce::String& t) { const float v = freqParse(t); return v < 0.0f ? 20000.0f : v; })));
+
+        layout.add(std::make_unique<juce::AudioParameterFloat>(
+            juce::ParameterID{ layerParamID(l, "pan"), 1 }, name + "Pan", Range(-100.0f, 100.0f, 1.0f), 0.0f,
+            juce::AudioParameterFloatAttributes().withStringFromValueFunction([](float v, int)
+                {
+                    const int n = juce::roundToInt(v);
+                    return n == 0 ? juce::String("C") : juce::String(std::abs(n)) + (n < 0 ? " L" : " R");
+                })));
+        addFloat(layerParamID(l, "width"), name + "Stereo Separation", Range(0.0f, 200.0f, 1.0f), 100.0f); // %: 0 mono, 100 as is
 
         addFloat(layerParamID(l, "stretch"), name + "Stretch",
             Range(25.0f, 400.0f,
@@ -209,6 +220,10 @@ void AudioPluginAudioProcessor::prepareToPlay(double sampleRate, int samplesPerB
         f.hpMix.setCurrentAndTargetValue(0.0f);
         f.lpMix.setCurrentAndTargetValue(0.0f);
         f.hpActive = f.lpActive = false;
+        f.pan.reset(sampleRate, 0.015);
+        f.width.reset(sampleRate, 0.015);
+        f.pan.setCurrentAndTargetValue(fxp[(size_t)l].pan->load() * 0.01f);
+        f.width.setCurrentAndTargetValue(fxp[(size_t)l].width->load() * 0.01f);
     }
     for (int l = 0; l < kNumLayers; ++l)
         stopArp(l);
@@ -686,6 +701,8 @@ void AudioPluginAudioProcessor::renderVoices(int start, int num, const SlotParam
             }
 
             float g = gain * envValue;
+            if (p.shape != nullptr && !p.shape->flat) // volume shape drawn on the waveform, by position in the sound
+                g *= p.shape->valueAt((float)(v.pos / (double)juce::jmax(1, len - 1)));
             // 2 ms fade at the very end of the file, so sounds that end abruptly (chopped samples) don't click
             // (not when the loop is about to wrap us back instead)
             if (const double remaining = (len - 1) - v.pos; remaining < tailFade && !(looping && v.beforeLoopEnd))
@@ -715,8 +732,11 @@ void AudioPluginAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, j
     buffer.clear();
 
     SlotParams sp[kNumLayers];
+    std::array<ShapePtr, kNumLayers> blockShapes; // keeps each sound's shape alive for this block
     for (size_t l = 0; l < kNumLayers; ++l)
     {
+        blockShapes[l] = std::atomic_load(&shapes[l]);
+        sp[l].shape = blockShapes[l].get();
         sp[l].loaded = std::atomic_load(&samples[l]) != nullptr;
         sp[l].playable = sp[l].loaded && muteParam[l]->load() < 0.5f; // can be picked; muted = layer only
         sp[l].gain = juce::Decibels::decibelsToGain(volParam[l]->load(), -60.0f);
@@ -914,6 +934,27 @@ void AudioPluginAudioProcessor::processSlotFx(int slot, int n)
         f.reverb.setParameters(rp);
         f.reverb.processStereo(bus.getWritePointer(0), bus.getWritePointer(1), n);
     }
+
+    // --- Stereo separation, then pan: last, so a sound and its effects move together
+    f.pan.setTargetValue(p.pan->load() * 0.01f);       // -1 = left, 1 = right
+    f.width.setTargetValue(p.width->load() * 0.01f);   // 0 = mono, 1 = as recorded, 2 = extra wide
+    if (f.pan.isSmoothing() || f.width.isSmoothing()
+        || std::abs(f.pan.getTargetValue()) > 0.001f || std::abs(f.width.getTargetValue() - 1.0f) > 0.001f)
+    {
+        auto* l = bus.getWritePointer(0);
+        auto* r = bus.getWritePointer(1);
+        for (int i = 0; i < n; ++i)
+        {
+            const float pan = f.pan.getNextValue(), width = f.width.getNextValue();
+            const float mid = 0.5f * (l[i] + r[i]), side = 0.5f * (l[i] - r[i]) * width;
+            float a = mid + side, b = mid - side;
+            if (pan < 0.0f) { a += b * -pan; b *= 1.0f + pan; }   // stereo pan: nothing is lost, it all moves over
+            else { b += a * pan;  a *= 1.0f - pan; }
+            const float keepLoudness = 1.0f / std::sqrt(1.0f + pan * pan); // same loudness at every pan position
+            l[i] = a * keepLoudness;
+            r[i] = b * keepLoudness;
+        }
+    }
 }
 
 //==============================================================================
@@ -952,6 +993,9 @@ void AudioPluginAudioProcessor::setSample(int layer, SamplePtr newSample)
 void AudioPluginAudioProcessor::timerCallback()
 {
     const juce::ScopedLock sl(retiredLock);
+    retiredShapes.erase(std::remove_if(retiredShapes.begin(), retiredShapes.end(),
+        [](const ShapePtr& s) { return s.use_count() <= 1; }),
+        retiredShapes.end());
     retired.erase(std::remove_if(retired.begin(), retired.end(),
         [](const SamplePtr& p) { return p.use_count() <= 1; }),
         retired.end());
@@ -978,6 +1022,19 @@ juce::ValueTree AudioPluginAudioProcessor::createStateTree(const juce::File& bas
                     juce::File(s->path).getRelativePathFrom(baseDir).replaceCharacter('\\', '/'), nullptr);
         }
     state.appendChild(paths, nullptr);
+
+    if (auto old = state.getChildWithName("Shapes"); old.isValid())
+        state.removeChild(old, nullptr);
+    juce::ValueTree shapeTree("Shapes");
+    for (int l = 0; l < kNumLayers; ++l)
+        if (auto shape = getShape(l); shape != nullptr && !shape->flat)
+        {
+            juce::StringArray pts;
+            for (const auto& pt : shape->points)
+                pts.add(juce::String(pt.x, 5) + "," + juce::String(pt.y, 5) + "," + juce::String(pt.bend, 4));
+            shapeTree.setProperty("slot" + juce::String(l), pts.joinIntoString(";"), nullptr);
+        }
+    state.appendChild(shapeTree, nullptr);
     state.setProperty("presetName", currentPresetName, nullptr);
     return state;
 }
@@ -1004,6 +1061,19 @@ bool AudioPluginAudioProcessor::applyStateTree(const juce::ValueTree& tree, cons
         }
         if (!loaded)
             clearSample(l); // missing samples come back empty
+    }
+
+    const auto shapeTree = tree.getChildWithName("Shapes");
+    for (int l = 0; l < kNumLayers; ++l)
+    {
+        std::vector<ShapePoint> pts;
+        for (const auto& item : juce::StringArray::fromTokens(shapeTree.getProperty("slot" + juce::String(l)).toString(), ";", {}))
+        {
+            const auto v = juce::StringArray::fromTokens(item, ",", {});
+            if (v.size() == 3)
+                pts.push_back({ v[0].getFloatValue(), v[1].getFloatValue(), v[2].getFloatValue() });
+        }
+        setShapePoints(l, pts); // empty / missing = no shape
     }
 
     currentPresetName = tree.getProperty("presetName").toString();
@@ -1126,6 +1196,8 @@ bool AudioPluginAudioProcessor::loadPreset(const juce::File& file)
 
 void AudioPluginAudioProcessor::initPreset()
 {
+    for (int l = 0; l < kNumLayers; ++l)
+        setShapePoints(l, {});
     for (auto* param : getParameters())
         param->setValueNotifyingHost(param->getDefaultValue());
     for (int l = 0; l < kNumLayers; ++l)
@@ -1149,6 +1221,11 @@ void AudioPluginAudioProcessor::copySettings(int from, int to, const juce::Strin
 
     for (const auto& name : names)
     {
+        if (name == "@shape")
+        {
+            setShapePoints(to, getShapePoints(from));
+            continue;
+        }
         if (name == "@layers")
         {
             // "from plays X" becomes "to plays X", for every X other than the two sounds involved
@@ -1170,6 +1247,65 @@ juce::StringArray AudioPluginAudioProcessor::settingNamesWithPrefix(int slot, co
             if (const auto id = ranged->getParameterID(); id.startsWith(slotPrefix + prefix))
                 names.add(id.fromFirstOccurrenceOf(slotPrefix, false, false));
     return names;
+}
+
+//==============================================================================
+float VolumeShape::segmentValue(const ShapePoint& a, const ShapePoint& b, float t)
+{
+    // Power curve, like an FL automation tension. A positive bend bulges upward whichever way it slopes.
+    const float bend = juce::jlimit(-1.0f, 1.0f, a.bend);
+    const float exponent = std::pow(8.0f, b.y > a.y ? -bend : bend);
+    return a.y + (b.y - a.y) * std::pow(juce::jlimit(0.0f, 1.0f, t), exponent);
+}
+
+float VolumeShape::evaluate(const std::vector<ShapePoint>& pts, float x)
+{
+    if (pts.empty()) return 1.0f;
+    if (x <= pts.front().x) return pts.front().y;
+    for (size_t i = 0; i + 1 < pts.size(); ++i)
+        if (x <= pts[i + 1].x)
+        {
+            const float w = pts[i + 1].x - pts[i].x;
+            return segmentValue(pts[i], pts[i + 1], w > 0.0f ? (x - pts[i].x) / w : 1.0f);
+        }
+    return pts.back().y;
+}
+
+std::vector<ShapePoint> AudioPluginAudioProcessor::getShapePoints(int slot) const
+{
+    if (auto shape = getShape(slot)) return shape->points;
+    return VolumeShape::defaultPoints();
+}
+
+void AudioPluginAudioProcessor::setShapePoints(int slot, std::vector<ShapePoint> pts)
+{
+    if (slot < 0 || slot >= kNumLayers) return;
+
+    // Tidy up: clamp, sort, and pin the ends to the start and end of the sound
+    for (auto& p : pts)
+    {
+        p.x = juce::jlimit(0.0f, 1.0f, p.x);
+        p.y = juce::jlimit(0.0f, 1.0f, p.y);
+        p.bend = juce::jlimit(-1.0f, 1.0f, p.bend);
+    }
+    std::stable_sort(pts.begin(), pts.end(), [](const ShapePoint& a, const ShapePoint& b) { return a.x < b.x; });
+    if (pts.size() < 2) pts = VolumeShape::defaultPoints();
+    pts.front().x = 0.0f;
+    pts.back().x = 1.0f;
+
+    auto shape = std::make_shared<VolumeShape>();
+    shape->points = pts;
+    shape->flat = true;
+    for (size_t i = 0; i < shape->table.size(); ++i)
+    {
+        shape->table[i] = VolumeShape::evaluate(pts, (float)i / (float)(shape->table.size() - 1));
+        if (shape->table[i] < 0.9995f) shape->flat = false;
+    }
+
+    const juce::ScopedLock sl(retiredLock);
+    if (auto old = std::atomic_load(&shapes[(size_t)slot]))
+        retiredShapes.push_back(std::move(old)); // never let the audio thread hold the last reference
+    std::atomic_store(&shapes[(size_t)slot], ShapePtr(std::move(shape)));
 }
 
 juce::Array<juce::File> AudioPluginAudioProcessor::getKitFolders()
